@@ -2,7 +2,10 @@
 target = "thumbv8m.main-none-eabihf"
 
 [target.thumbv8m.main-none-eabihf]
-runner = "probe-rs run --chip RP235x"
+# runner = "probe-rs run --chip RP235x"   # SWD debug probe
+# runner = "elf2uf2-rs -d"                # RP2040 only
+# `cargo run` generates firmware.uf2, then: cp firmware.uf2 /media/tmpk/RP2350/
+runner = "elf2uf2-rs"
 rustflags = [
     "-C", "link-arg=--nmagic",
     "-C", "link-arg=-Tlink.x",
