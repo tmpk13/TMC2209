@@ -1,0 +1,51 @@
+[package]
+name = "tmc2209-fw"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+embassy-rp = { version = "0.10", features = [
+    "rp235xa",
+    "time-driver",
+    "critical-section-impl",
+    "rt",
+] }
+embassy-executor = { version = "0.9", features = [
+    "arch-cortex-m",
+    "executor-thread",
+    "executor-interrupt",
+] }
+embassy-time = { version = "0.5", features = ["tick-hz-1_000_000"] }
+embassy-sync = "0.8"
+embassy-futures = "0.1"
+embassy-usb = "0.6"
+
+tmc2209 = { version = "0.3", default-features = false }
+embedded-io = "0.7"
+embedded-io-async = "0.7"
+pio = "0.3"
+pio-proc = "0.3"
+
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+panic-probe = { version = "1", features = ["print-defmt"] }
+defmt = "1"
+defmt-rtt = "1"
+
+fixed = "1"
+libm = "0.2"
+heapless = "0.8"
+static_cell = "2"
+portable-atomic = { version = "1", features = ["critical-section"] }
+
+[profile.release]
+debug = 2
+lto = "fat"
+opt-level = "s"
+codegen-units = 1
+
+[profile.dev]
+debug = 2
+opt-level = "s"
+lto = "off"
