@@ -1,9 +1,9 @@
 [build]
 target = "thumbv8m.main-none-eabihf"
 
+# RP2350 (Pico 2 / RP235xA) — Cortex-M33 + FPU.
 [target.thumbv8m.main-none-eabihf]
 # runner = "probe-rs run --chip RP235x"   # SWD debug probe
-# runner = "elf2uf2-rs -d"                # RP2040 only
 # `cargo run` generates firmware.uf2, then: cp firmware.uf2 /media/tmpk/RP2350/
 runner = "elf2uf2-rs"
 rustflags = [
@@ -12,6 +12,31 @@ rustflags = [
     "-C", "link-arg=-Tdefmt.x",
     "-C", "target-cpu=cortex-m33",
 ]
+
+# RP2040 (original Pico) — Cortex-M0+, no FPU.
+# `-Tlink-rp.x` is required: it's embassy-rp's linker script that places the
+# boot2 stage-2 bootloader in the BOOT2 region. Without it the bootrom rejects
+# the image and falls back to BOOTSEL.
+[target.thumbv6m-none-eabi]
+# runner = "probe-rs run --chip RP2040"   # SWD debug probe
+# `cargo run` generates firmware.uf2, then: cp firmware.uf2 /media/tmpk/RPI-RP2/
+runner = "elf2uf2-rs -d"
+rustflags = [
+    "-C", "link-arg=--nmagic",
+    "-C", "link-arg=-Tlink.x",
+    "-C", "link-arg=-Tlink-rp.x",
+    "-C", "link-arg=-Tdefmt.x",
+    "-C", "target-cpu=cortex-m0plus",
+]
+
+[alias]
+# Default `cargo build` / `cargo run` targets the RP2350. The aliases below
+# pin both the target triple and the chip feature, so callers don't have to
+# remember the combo.
+build-pico2 = "build --target thumbv8m.main-none-eabihf --no-default-features --features rp2350"
+run-pico2   = "run   --target thumbv8m.main-none-eabihf --no-default-features --features rp2350"
+build-pico  = "build --target thumbv6m-none-eabi        --no-default-features --features rp2040"
+run-pico    = "run   --target thumbv6m-none-eabi        --no-default-features --features rp2040"
 
 [env]
 DEFMT_LOG = "info"

@@ -8,6 +8,10 @@
 //!   0x02  Enable          { mask: u8 }
 //!   0x03  Home            { joint: u8 }
 //!   0x04  GetState        {} → StateReport
+//!   0x05  SetTmcConfig    { joint: u8, flags: u8 }
+//!         flags bit 0: stealthchop (1=on, 0=spreadCycle)
+//!         flags bit 1: interpolate to 256 µsteps
+//!         flags bit 2: invert shaft direction
 //!
 //! Reports (fw → host):
 //!   0x81  StateReport     { positions: [i32; 3], flags: u8 }
@@ -23,7 +27,13 @@ pub enum Command {
     Enable { mask: u8 },
     Home { joint: u8 },
     GetState,
+    SetTmcConfig { joint: u8, flags: u8 },
 }
+
+// SetTmcConfig flag bits.
+pub const TMC_FLAG_STEALTHCHOP: u8 = 1 << 0;
+pub const TMC_FLAG_INTERPOLATE: u8 = 1 << 1;
+pub const TMC_FLAG_SHAFT_INVERT: u8 = 1 << 2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct StateReport {
@@ -64,6 +74,15 @@ pub fn decode(bytes: &[u8]) -> Result<Command, DecodeError> {
             joint: *rest.first().ok_or(DecodeError::Short)?,
         }),
         0x04 => Ok(Command::GetState),
+        0x05 => {
+            if rest.len() < 2 {
+                return Err(DecodeError::Short);
+            }
+            Ok(Command::SetTmcConfig {
+                joint: rest[0],
+                flags: rest[1],
+            })
+        }
         _ => Err(DecodeError::BadTag),
     }
 }

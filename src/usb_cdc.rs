@@ -15,14 +15,20 @@ use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::{Builder, Config};
 use static_cell::StaticCell;
 
+use crate::driver::{DriverBus, JointId};
 use crate::motion::{NUM_JOINTS, POSITIONS};
 use crate::protocol::{self, encode_state, Command, StateReport};
 
 pub type CommandSender = Sender<'static, CriticalSectionRawMutex, Command, 8>;
 
 /// Entry point for the USB task. Owns the `Driver` (USB peripheral) and the
-/// outgoing command channel to the motion task.
-pub async fn run(usb_driver: Driver<'static, USB>, commands: CommandSender) -> ! {
+/// outgoing command channel to the motion task. The driver bus is needed so
+/// `SetTmcConfig` can re-write the TMC2209 registers inline.
+pub async fn run(
+    usb_driver: Driver<'static, USB>,
+    commands: CommandSender,
+    bus: &'static DriverBus,
+) -> ! {
     static CONFIG_DESC: StaticCell<[u8; 256]> = StaticCell::new();
     static BOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();
     static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
@@ -52,7 +58,7 @@ pub async fn run(usb_driver: Driver<'static, USB>, commands: CommandSender) -> !
         loop {
             class.wait_connection().await;
             defmt::info!("usb connected");
-            let _ = read_loop(&mut class, commands).await;
+            let _ = read_loop(&mut class, commands, bus).await;
             defmt::info!("usb disconnected");
         }
     };
@@ -64,6 +70,7 @@ pub async fn run(usb_driver: Driver<'static, USB>, commands: CommandSender) -> !
 async fn read_loop(
     class: &mut CdcAcmClass<'static, Driver<'static, USB>>,
     commands: CommandSender,
+    bus: &'static DriverBus,
 ) -> Result<(), embassy_usb::driver::EndpointError> {
     let mut rx = [0u8; 64];
     let mut tx = [0u8; 32];
@@ -77,6 +84,16 @@ async fn read_loop(
                 let report = current_state();
                 let len = encode_state(&report, &mut tx);
                 class.write_packet(&tx[..len]).await?;
+            }
+            Ok(Command::SetTmcConfig { joint, flags }) => {
+                match JointId::from_index(joint) {
+                    Some(j) => {
+                        if let Err(e) = bus.apply_tmc_flags(j, flags).await {
+                            defmt::warn!("tmc config j{} failed: {:?}", joint, e);
+                        }
+                    }
+                    None => defmt::warn!("tmc config: bad joint {}", joint),
+                }
             }
             Ok(cmd) => {
                 // Non-blocking send — drop if the motion task is backed up.

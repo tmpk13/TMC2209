@@ -18,6 +18,8 @@ use embedded_io_async::{Read, Write};
 
 use tmc2209::{data::MicroStepResolution, read_request, reg, write_request, ReadResponse, Reader};
 
+use crate::protocol::{TMC_FLAG_INTERPOLATE, TMC_FLAG_SHAFT_INVERT, TMC_FLAG_STEALTHCHOP};
+
 /// Joint index → TMC2209 UART address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -32,7 +34,19 @@ impl JointId {
     pub fn addr(self) -> u8 {
         self as u8
     }
+    pub fn from_index(i: u8) -> Option<Self> {
+        match i {
+            0 => Some(Self::J0),
+            1 => Some(Self::J1),
+            2 => Some(Self::J2),
+            _ => None,
+        }
+    }
 }
+
+/// Defaults used by `apply_default_config`, expressed as protocol flag bits.
+/// Keep in sync so the host UI can show the firmware's initial state.
+pub const DEFAULT_TMC_FLAGS: u8 = TMC_FLAG_STEALTHCHOP | TMC_FLAG_INTERPOLATE;
 
 pub struct DriverBus {
     uart: Mutex<CriticalSectionRawMutex, BufferedUart>,
@@ -97,12 +111,38 @@ impl DriverBus {
     /// - stealthChop enabled (smooth, quiet low-speed motion)
     /// - internal step source via `VACTUAL` disabled (we drive STEP/DIR pins)
     pub async fn apply_default_config(&self, joint: JointId) -> Result<(), Error> {
+        self.apply_gconf_chopconf(joint, DEFAULT_TMC_FLAGS).await?;
+
+        // Motor current: IRUN=16, IHOLD=8, IHOLDDELAY=8 — conservative defaults.
+        // Real current depends on sense-resistor value; tune per board.
+        let mut ihold = reg::IHOLD_IRUN::default();
+        ihold.set_ihold(8);
+        ihold.set_irun(16);
+        ihold.set_ihold_delay(8);
+        self.write_register(joint, ihold).await?;
+
+        Ok(())
+    }
+
+    /// Re-write GCONF + CHOPCONF for one joint with the toggleable bits taken
+    /// from `flags` (see `protocol::TMC_FLAG_*`). Other fields keep the
+    /// firmware's baseline values.
+    pub async fn apply_tmc_flags(&self, joint: JointId, flags: u8) -> Result<(), Error> {
+        self.apply_gconf_chopconf(joint, flags).await
+    }
+
+    async fn apply_gconf_chopconf(&self, joint: JointId, flags: u8) -> Result<(), Error> {
+        let stealthchop = flags & TMC_FLAG_STEALTHCHOP != 0;
+        let interpolate = flags & TMC_FLAG_INTERPOLATE != 0;
+        let shaft_invert = flags & TMC_FLAG_SHAFT_INVERT != 0;
+
         // Enable the driver and tell it we want PDN_UART to control it
         // (pdn_disable = 1) instead of the standalone pin mode.
         let mut gconf = reg::GCONF::default();
         gconf.set_pdn_disable(true);
         gconf.set_mstep_reg_select(true); // MRES comes from CHOPCONF, not MS1/MS2
-        gconf.set_en_spread_cycle(false); // stealthChop
+        gconf.set_en_spread_cycle(!stealthchop);
+        gconf.set_shaft(shaft_invert);
         self.write_register(joint, gconf).await?;
 
         // 16 microsteps, TOFF=3 (driver enabled), TBL=2, HSTRT=5, HEND=2
@@ -112,16 +152,8 @@ impl DriverBus {
         chop.set_hend(2);
         chop.set_tbl(2);
         chop.set_mres(MicroStepResolution::from_microsteps(16));
-        chop.set_intpol(true); // interpolate to 256 µsteps internally
+        chop.set_intpol(interpolate);
         self.write_register(joint, chop).await?;
-
-        // Motor current: IRUN=16, IHOLD=8, IHOLDDELAY=8 — conservative defaults.
-        // Real current depends on sense-resistor value; tune per board.
-        let mut ihold = reg::IHOLD_IRUN::default();
-        ihold.set_ihold(8);
-        ihold.set_irun(16);
-        ihold.set_ihold_delay(8);
-        self.write_register(joint, ihold).await?;
 
         Ok(())
     }

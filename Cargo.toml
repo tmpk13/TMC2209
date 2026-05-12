@@ -4,9 +4,13 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = ["rp2350"]
+rp2040 = ["embassy-rp/rp2040", "embassy-rp/boot2-w25q080"]
+rp2350 = ["embassy-rp/rp235xa"]
+
 [dependencies]
-embassy-rp = { version = "0.10", features = [
-    "rp235xa",
+embassy-rp = { version = "0.10", default-features = false, features = [
     "time-driver",
     "critical-section-impl",
     "rt",

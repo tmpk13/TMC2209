@@ -81,3 +81,83 @@ firmware currently writes `IRUN = 16, IHOLD = 8` in
 USB-C / micro-USB straight into the Pico 2's native USB port. The firmware
 enumerates as a CDC-ACM serial device (`16c0:27dd`, product string
 `tmc2209-fw`).
+
+## Scaling to 8 drivers
+
+The TMC2209 only exposes 2 address bits (MS1/MS2), so a single shared
+PDN_UART line tops out at 4 drivers. Eight drivers therefore need **two
+UART buses**, each carrying up to 4 addressed drivers. Step generation
+needs 8 PIO state machines, which fits cleanly into PIO0 + PIO1 (4 SMs
+each) — this layout works on Pico 2 (RP2350) and the original Pico
+(RP2040) without using PIO2.
+
+Pin map — 21 GPIOs, all within the Pico 2 header range (GP0..GP22):
+
+| Pico 2 pin | Signal       | Bus / PIO   | Joint | TMC2209 addr |
+|------------|--------------|-------------|-------|--------------|
+| GP0        | UART0 TX     | Bus B       | J4..J7 shared | — |
+| GP1        | UART0 RX     | Bus B       | J4..J7 shared | — |
+| GP2        | STEP0        | PIO0 SM0    | J0    | 0 (Bus A)    |
+| GP3        | STEP1        | PIO0 SM1    | J1    | 1 (Bus A)    |
+| GP4        | STEP2        | PIO0 SM2    | J2    | 2 (Bus A)    |
+| GP5        | STEP3        | PIO0 SM3    | J3    | 3 (Bus A)    |
+| GP6        | DIR0         | —           | J0    | —            |
+| GP7        | DIR1         | —           | J1    | —            |
+| GP8        | UART1 TX     | Bus A       | J0..J3 shared | — |
+| GP9        | UART1 RX     | Bus A       | J0..J3 shared | — |
+| GP10       | DIR2         | —           | J2    | —            |
+| GP11       | DIR3         | —           | J3    | —            |
+| GP12       | STEP4        | PIO1 SM0    | J4    | 0 (Bus B)    |
+| GP13       | STEP5        | PIO1 SM1    | J5    | 1 (Bus B)    |
+| GP14       | STEP6        | PIO1 SM2    | J6    | 2 (Bus B)    |
+| GP15       | STEP7        | PIO1 SM3    | J7    | 3 (Bus B)    |
+| GP16       | DIR4         | —           | J4    | —            |
+| GP17       | DIR5         | —           | J5    | —            |
+| GP18       | DIR6         | —           | J6    | —            |
+| GP19       | DIR7         | —           | J7    | —            |
+| GP20       | EN (shared)  | —           | all 8 | active-low   |
+
+### Two UART buses
+
+Each bus is wired exactly like the 3-driver bus above — TX and RX tied
+together through a 1 kOhm series resistor on the MCU side, with the
+joined node fanned out to the PDN_UART pin of every driver on that bus.
+Optional 10 kOhm pull-up to VIO per bus.
+
+```
+Bus A:  GP8 --1k-- + -- PDN_UART (J0, J1, J2, J3)
+        GP9 ------ +
+
+Bus B:  GP0 --1k-- + -- PDN_UART (J4, J5, J6, J7)
+        GP1 ------ +
+```
+
+### Address straps (8 drivers)
+
+Address is per-bus, so J0 and J4 both strap to address 0 (just on
+different wires):
+
+| Joint | Bus | MS2 | MS1 | UART addr |
+|-------|-----|-----|-----|-----------|
+| J0    | A   | GND | GND | 0 |
+| J1    | A   | GND | VIO | 1 |
+| J2    | A   | VIO | GND | 2 |
+| J3    | A   | VIO | VIO | 3 |
+| J4    | B   | GND | GND | 0 |
+| J5    | B   | GND | VIO | 1 |
+| J6    | B   | VIO | GND | 2 |
+| J7    | B   | VIO | VIO | 3 |
+
+### Firmware changes required
+
+This is a wiring map only — the current firmware drives 3 joints on a
+single bus (see [src/board.rs](src/board.rs) and
+[src/driver.rs](src/driver.rs)). To actually run 8 drivers you need to:
+
+- Add a second `DriverBus` for UART0 on GP0/GP1 and route J4..J7 to it.
+- Extend `JointId` to `J0..J7` and split `addr()` so it returns the
+  per-bus address (joint index mod 4).
+- Bring up PIO1 alongside PIO0 in `motion.rs` and add 4 more STEP/DIR
+  pin aliases in `board.rs`.
+- Reassign EN to GP20 (the existing GP10 is reused as DIR2 in this
+  layout).

@@ -25,6 +25,9 @@ use crate::driver::{DriverBus, JointId};
 use crate::motion::MotionController;
 use crate::protocol::Command;
 
+// RP2350 boots from a signed image block in flash; RP2040 boots from a
+// stage-2 bootloader supplied by `embassy-rp` via the `boot2-*` feature.
+#[cfg(chip_rp2350)]
 #[link_section = ".start_block"]
 #[used]
 pub static IMAGE_DEF: embassy_rp::block::ImageDef = embassy_rp::block::ImageDef::secure_exe();
@@ -70,7 +73,7 @@ async fn main(spawner: Spawner) {
 
     // ── Spawn tasks ───────────────────────────────────────────────────────
     spawner.must_spawn(driver_init_task(bus));
-    spawner.must_spawn(usb_task(usb_driver));
+    spawner.must_spawn(usb_task(usb_driver, bus));
 
     // Main task runs the motion control loop forever.
     motion.run(COMMANDS.receiver()).await
@@ -87,6 +90,6 @@ async fn driver_init_task(bus: &'static DriverBus) {
 }
 
 #[embassy_executor::task]
-async fn usb_task(driver: UsbDriver<'static, USB>) {
-    usb_cdc::run(driver, COMMANDS.sender()).await;
+async fn usb_task(driver: UsbDriver<'static, USB>, bus: &'static DriverBus) {
+    usb_cdc::run(driver, COMMANDS.sender(), bus).await;
 }

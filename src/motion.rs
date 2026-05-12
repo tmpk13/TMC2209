@@ -41,8 +41,8 @@ use crate::protocol::{Command, StateReport};
 
 pub const NUM_JOINTS: usize = 3;
 const TICK_HZ: u32 = 200;
-/// Cycles the PIO program spends per step pulse (1 high delay + 1 low delay + overhead).
-const PIO_CYCLES_PER_STEP: u32 = 16;
+/// PIO cycles per step pulse: jmp(1) + nop_high(1+7) + nop_low(1+7) + jmp_dec(1) = 18.
+const PIO_CYCLES_PER_STEP: u32 = 18;
 
 #[derive(Clone, Copy, Debug)]
 pub struct JointTarget {
@@ -132,10 +132,14 @@ impl<'d, const SM: usize> Joint<'d, SM> {
         let divider = calculate_pio_clock_divider(target_freq * PIO_CYCLES_PER_STEP);
         self.sm.set_clock_divider(divider);
         self.sm.clkdiv_restart();
-        let _ = self.sm.tx().try_push(n);
 
-        self.position += steps;
-        POSITIONS[idx].store(self.position, Ordering::Relaxed);
+        if self.sm.tx().try_push(n) {
+            self.position += steps;
+            POSITIONS[idx].store(self.position, Ordering::Relaxed);
+        } else {
+            // FIFO full — undo velocity/frac so we retry next tick.
+            self.frac_accum += steps as f32;
+        }
     }
 }
 
@@ -167,16 +171,14 @@ impl<'d> MotionController<'d> {
 
         let prg = pio::pio_asm!(
             ".side_set 1",
-            ".wrap_target",
+            "start:",
             "    pull block        side 0",
             "    mov x, osr        side 0",
             "loop_:",
-            "    jmp !x done       side 0",
+            "    jmp !x start      side 0",
             "    nop               side 1 [7]",
             "    nop               side 0 [7]",
             "    jmp x-- loop_     side 0",
-            "done:",
-            ".wrap",
         );
         let loaded = common.load_program(&prg.program);
 
@@ -242,7 +244,8 @@ impl<'d> MotionController<'d> {
                 self.j1.enabled = mask & 0b010 != 0;
                 self.j2.enabled = mask & 0b100 != 0;
             }
-            Command::Home { .. } | Command::GetState => {}
+            // SetTmcConfig is handled in the USB task (it owns the driver bus).
+            Command::Home { .. } | Command::GetState | Command::SetTmcConfig { .. } => {}
         }
     }
 

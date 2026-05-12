@@ -1,4 +1,7 @@
-//! Pin map for the Pico 2 (RP2350A) dev board.
+//! Pin map. Identical for the Pico 2 (RP2350A) and the original Pico (RP2040)
+//! — both share the same 40-pin Pico footprint, so the GPIO numbers below
+//! work on either board. The chip is selected at compile time via the
+//! `rp2040` / `rp2350` cargo features.
 //!
 //! Change these type aliases here and everything else follows. If you move to
 //! a custom PCB, update this module and leave the rest of the firmware alone.
