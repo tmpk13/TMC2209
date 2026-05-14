@@ -15,9 +15,35 @@ use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::{Builder, Config};
 use static_cell::StaticCell;
 
-use crate::driver::{DriverBus, JointId};
+use tmc2209::reg;
+
+use crate::driver::{DriverBus, Error as DriverError, JointId};
 use crate::motion::{NUM_JOINTS, POSITIONS};
-use crate::protocol::{self, encode_state, Command, StateReport};
+use crate::protocol::{
+    self, encode_state, encode_tmc_config, encode_version, Command, StateReport, TmcConfigReport,
+    TmcConfigStatus, VersionReport, CHIP_ID_RP2040, CHIP_ID_RP2350, RX_TRACE_LEN,
+};
+
+/// Compile-time chip id, picked by the same `chip_*` cfg the linker uses.
+#[cfg(chip_rp2040)]
+const CHIP_ID: u8 = CHIP_ID_RP2040;
+#[cfg(chip_rp2350)]
+const CHIP_ID: u8 = CHIP_ID_RP2350;
+
+/// Build epoch (Unix seconds) from build.rs. `parse::<u32>()` is `const`-safe
+/// in newer toolchains but not const here, so we parse at startup the first
+/// time it's needed; the value is fixed for the binary's lifetime.
+const BUILD_EPOCH_STR: &str = env!("BUILD_EPOCH");
+const GIT_SHORT: &str = env!("GIT_SHORT");
+
+fn version_report() -> VersionReport {
+    let epoch = BUILD_EPOCH_STR.parse::<u32>().unwrap_or(0);
+    let mut git = [0u8; 12];
+    let bytes = GIT_SHORT.as_bytes();
+    let n = bytes.len().min(git.len());
+    git[..n].copy_from_slice(&bytes[..n]);
+    VersionReport { chip: CHIP_ID, epoch, git }
+}
 
 pub type CommandSender = Sender<'static, CriticalSectionRawMutex, Command, 8>;
 
@@ -73,7 +99,7 @@ async fn read_loop(
     bus: &'static DriverBus,
 ) -> Result<(), embassy_usb::driver::EndpointError> {
     let mut rx = [0u8; 64];
-    let mut tx = [0u8; 32];
+    let mut tx = [0u8; 64]; // headroom for the 28-byte TmcConfig report
     loop {
         let n = class.read_packet(&mut rx).await?;
         if n == 0 {
@@ -95,6 +121,15 @@ async fn read_loop(
                     None => defmt::warn!("tmc config: bad joint {}", joint),
                 }
             }
+            Ok(Command::GetTmcConfig { joint }) => {
+                let report = read_tmc_config(bus, joint).await;
+                let len = encode_tmc_config(&report, &mut tx);
+                class.write_packet(&tx[..len]).await?;
+            }
+            Ok(Command::GetVersion) => {
+                let len = encode_version(&version_report(), &mut tx);
+                class.write_packet(&tx[..len]).await?;
+            }
             Ok(cmd) => {
                 // Non-blocking send — drop if the motion task is backed up.
                 let _ = commands.try_send(cmd);
@@ -110,4 +145,57 @@ fn current_state() -> StateReport {
         *slot = POSITIONS[i].load(Ordering::Relaxed);
     }
     StateReport { positions, flags: 0 }
+}
+
+/// Read GCONF + CHOPCONF for `joint` over the TMC2209 UART. Always
+/// produces a report — `ok=false` with zero fields if the bus didn't
+/// answer (bad joint id, timeout, CRC). The host uses this to verify
+/// that the bits a SetTmcConfig requested are actually set on the chip.
+async fn read_tmc_config(bus: &'static DriverBus, joint: u8) -> TmcConfigReport {
+    fn err_status(e: DriverError) -> u8 {
+        match e {
+            DriverError::Uart => TmcConfigStatus::UartError as u8,
+            DriverError::Crc => TmcConfigStatus::Timeout as u8,
+            DriverError::Timeout => TmcConfigStatus::Timeout as u8,
+            DriverError::BadRegister => TmcConfigStatus::BadRegister as u8,
+        }
+    }
+    let empty_trace = [0u8; RX_TRACE_LEN];
+    let Some(j) = JointId::from_index(joint) else {
+        defmt::warn!("get tmc config: bad joint {}", joint);
+        return TmcConfigReport {
+            joint,
+            status: TmcConfigStatus::BadJoint as u8,
+            gconf: 0,
+            chopconf: 0,
+            rx_count: 0,
+            rx_trace: empty_trace,
+        };
+    };
+    // Use the traced variant for GCONF so the host can see the raw bytes
+    // that came back (or didn't). CHOPCONF is read normally — if GCONF
+    // already failed we never get here, and the GCONF trace is the
+    // diagnostic we care about for "is the bus alive at all?".
+    let (g_res, rx_trace, rx_count) = bus.read_register_traced::<reg::GCONF>(j).await;
+    let gconf: u32 = match g_res {
+        Ok(g) => g.into(),
+        Err(e) => {
+            defmt::warn!("read GCONF j{} failed: {:?} (rx_count={})", joint, e, rx_count);
+            return TmcConfigReport {
+                joint, status: err_status(e), gconf: 0, chopconf: 0, rx_count, rx_trace,
+            };
+        }
+    };
+    let chopconf = match bus.read_register::<reg::CHOPCONF>(j).await {
+        Ok(c) => c.into(),
+        Err(e) => {
+            defmt::warn!("read CHOPCONF j{} failed: {:?}", joint, e);
+            return TmcConfigReport {
+                joint, status: err_status(e), gconf: 0, chopconf: 0, rx_count, rx_trace,
+            };
+        }
+    };
+    TmcConfigReport {
+        joint, status: TmcConfigStatus::Ok as u8, gconf, chopconf, rx_count, rx_trace,
+    }
 }

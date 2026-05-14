@@ -85,6 +85,17 @@ struct Joint<'d, const SM: usize> {
 }
 
 impl<'d, const SM: usize> Joint<'d, SM> {
+    /// Adopt `position` as the joint's current microstep count without
+    /// commanding any motion. Snaps target to match and clears the motion
+    /// integrators so the next tick starts from rest at the new origin.
+    fn set_position(&mut self, idx: usize, position: i32) {
+        self.position = position;
+        self.target.position = position;
+        self.velocity = 0.0;
+        self.frac_accum = 0.0;
+        POSITIONS[idx].store(position, Ordering::Relaxed);
+    }
+
     fn tick(&mut self, idx: usize, dt_us: u32) {
         if !self.enabled {
             self.velocity = 0.0;
@@ -244,8 +255,19 @@ impl<'d> MotionController<'d> {
                 self.j1.enabled = mask & 0b010 != 0;
                 self.j2.enabled = mask & 0b100 != 0;
             }
-            // SetTmcConfig is handled in the USB task (it owns the driver bus).
-            Command::Home { .. } | Command::GetState | Command::SetTmcConfig { .. } => {}
+            Command::SetPosition { joint, position } => match joint {
+                0 => self.j0.set_position(0, position),
+                1 => self.j1.set_position(1, position),
+                2 => self.j2.set_position(2, position),
+                _ => defmt::warn!("set position: bad joint {}", joint),
+            },
+            // SetTmcConfig and GetTmcConfig are handled in the USB task
+            // (it owns the driver bus).
+            Command::Home { .. }
+            | Command::GetState
+            | Command::SetTmcConfig { .. }
+            | Command::GetTmcConfig { .. }
+            | Command::GetVersion => {}
         }
     }
 

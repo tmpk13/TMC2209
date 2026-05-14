@@ -74,6 +74,70 @@ impl DriverBus {
         Ok(())
     }
 
+    /// Capacity of the raw RX trace buffer captured by `read_register_traced`.
+    pub const RX_TRACE_CAP: usize = 16;
+
+    /// Like [`read_register`] but also returns the raw bytes received on the
+    /// wire during the read attempt (truncated to `RX_TRACE_CAP`). Used by
+    /// the diagnostic GetTmcConfig path so the host can show hex of what
+    /// actually came back, distinguishing "chip silent" (0 bytes) from
+    /// "chip replied with garbage" (some bytes, no parse).
+    pub async fn read_register_traced<R>(
+        &self,
+        joint: JointId,
+    ) -> (Result<R, Error>, [u8; Self::RX_TRACE_CAP], u8)
+    where
+        R: reg::ReadableRegister,
+    {
+        let mut trace = [0u8; Self::RX_TRACE_CAP];
+        let mut trace_len: u8 = 0;
+        let req = read_request::<R>(joint.addr());
+        let mut uart = self.uart.lock().await;
+
+        // Drain stale bytes from prior writes' echoes etc.
+        let mut scratch = [0u8; 16];
+        while let Ok(Ok(_)) =
+            with_timeout(Duration::from_millis(1), uart.read(&mut scratch)).await
+        {}
+
+        if uart.write_all(req.bytes()).await.is_err() {
+            return (Err(Error::Uart), trace, trace_len);
+        }
+
+        let mut reader = Reader::default();
+        let mut buf = [0u8; 16];
+        let res = with_timeout(Duration::from_millis(50), async {
+            loop {
+                let n = match uart.read(&mut buf).await {
+                    Ok(n) => n,
+                    Err(_) => return Err(Error::Uart),
+                };
+                if n == 0 {
+                    continue;
+                }
+                // Append to trace, capped.
+                let room = (Self::RX_TRACE_CAP as u8).saturating_sub(trace_len) as usize;
+                let take = n.min(room);
+                if take > 0 {
+                    let dst = trace_len as usize;
+                    trace[dst..dst + take].copy_from_slice(&buf[..take]);
+                    trace_len += take as u8;
+                }
+                if let (_, Some(r)) = reader.read_response(&buf[..n]) {
+                    return Ok(r);
+                }
+            }
+        })
+        .await;
+
+        let parsed: Result<R, Error> = match res {
+            Ok(Ok(resp)) => resp.register::<R>().map_err(|_| Error::BadRegister),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(Error::Timeout),
+        };
+        (parsed, trace, trace_len)
+    }
+
     /// Read a TMC2209 register from one driver.
     pub async fn read_register<R>(&self, joint: JointId) -> Result<R, Error>
     where
@@ -81,15 +145,28 @@ impl DriverBus {
     {
         let req = read_request::<R>(joint.addr());
         let mut uart = self.uart.lock().await;
+
+        // Drain any stale bytes left in the RX buffer from a previous
+        // operation (e.g., partial echo from a prior write_register that
+        // straddled the 10ms drain window). Without this, `Reader` may
+        // try to interpret junk as a response prefix and give up.
+        let mut scratch = [0u8; 16];
+        while let Ok(Ok(_)) =
+            with_timeout(Duration::from_millis(1), uart.read(&mut scratch)).await
+        {}
+
         uart.write_all(req.bytes()).await.map_err(|_| Error::Uart)?;
 
-        // On the shared wire we'll first read the 4-byte echo of our own
-        // request, then 8 bytes of reply. `Reader` walks the stream and
-        // surfaces the response as soon as it sees the sync byte + payload,
-        // so we don't have to count bytes ourselves.
+        // On a shared single-wire bus we first see a 4-byte echo of our own
+        // request and then 8 bytes of reply. On a split TX/RX wiring the
+        // echo never arrives — only the 8-byte reply. `Reader` walks the
+        // stream and surfaces the response as soon as it sees the sync byte
+        // + payload, so we don't need to count bytes. 50ms is generous
+        // versus the ~1.4ms wall-clock of 16 bytes at 115200 baud, and
+        // forgiving of any UART/IRQ latency in the buffered driver.
         let mut reader = Reader::default();
         let mut buf = [0u8; 16];
-        let response: ReadResponse = with_timeout(Duration::from_millis(20), async {
+        let response: ReadResponse = with_timeout(Duration::from_millis(50), async {
             loop {
                 let n = uart.read(&mut buf).await.map_err(|_| Error::Uart)?;
                 if n == 0 {
