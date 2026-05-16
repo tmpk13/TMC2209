@@ -17,12 +17,17 @@ use static_cell::StaticCell;
 
 use tmc2209::reg;
 
-use crate::driver::{DriverBus, Error as DriverError, JointId};
-use crate::motion::{NUM_JOINTS, POSITIONS};
+use crate::driver::{Drivers, Error as DriverError, JointId};
+use crate::motion::{NUM_JOINTS, NUM_SERVOS, POSITIONS};
 use crate::protocol::{
     self, encode_state, encode_tmc_config, encode_version, Command, StateReport, TmcConfigReport,
-    TmcConfigStatus, VersionReport, CHIP_ID_RP2040, CHIP_ID_RP2350, RX_TRACE_LEN,
+    TmcConfigStatus, VersionReport, RX_TRACE_LEN,
 };
+#[cfg(chip_rp2040)]
+use crate::protocol::CHIP_ID_RP2040;
+#[cfg(chip_rp2350)]
+use crate::protocol::CHIP_ID_RP2350;
+use crate::servo::SERVO_POSITIONS;
 
 /// Compile-time chip id, picked by the same `chip_*` cfg the linker uses.
 #[cfg(chip_rp2040)]
@@ -48,12 +53,12 @@ fn version_report() -> VersionReport {
 pub type CommandSender = Sender<'static, CriticalSectionRawMutex, Command, 8>;
 
 /// Entry point for the USB task. Owns the `Driver` (USB peripheral) and the
-/// outgoing command channel to the motion task. The driver bus is needed so
-/// `SetTmcConfig` can re-write the TMC2209 registers inline.
+/// outgoing command channel to the motion task. The `Drivers` aggregator is
+/// needed so `SetTmcConfig` can re-write the TMC2209 registers inline.
 pub async fn run(
     usb_driver: Driver<'static, USB>,
     commands: CommandSender,
-    bus: &'static DriverBus,
+    drivers: &'static Drivers,
 ) -> ! {
     static CONFIG_DESC: StaticCell<[u8; 256]> = StaticCell::new();
     static BOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();
@@ -84,7 +89,7 @@ pub async fn run(
         loop {
             class.wait_connection().await;
             defmt::info!("usb connected");
-            let _ = read_loop(&mut class, commands, bus).await;
+            let _ = read_loop(&mut class, commands, drivers).await;
             defmt::info!("usb disconnected");
         }
     };
@@ -96,7 +101,7 @@ pub async fn run(
 async fn read_loop(
     class: &mut CdcAcmClass<'static, Driver<'static, USB>>,
     commands: CommandSender,
-    bus: &'static DriverBus,
+    drivers: &'static Drivers,
 ) -> Result<(), embassy_usb::driver::EndpointError> {
     let mut rx = [0u8; 64];
     let mut tx = [0u8; 64]; // headroom for the 28-byte TmcConfig report
@@ -114,7 +119,7 @@ async fn read_loop(
             Ok(Command::SetTmcConfig { joint, flags }) => {
                 match JointId::from_index(joint) {
                     Some(j) => {
-                        if let Err(e) = bus.apply_tmc_flags(j, flags).await {
+                        if let Err(e) = drivers.apply_tmc_flags(j, flags).await {
                             defmt::warn!("tmc config j{} failed: {:?}", joint, e);
                         }
                     }
@@ -122,7 +127,7 @@ async fn read_loop(
                 }
             }
             Ok(Command::GetTmcConfig { joint }) => {
-                let report = read_tmc_config(bus, joint).await;
+                let report = read_tmc_config(drivers, joint).await;
                 let len = encode_tmc_config(&report, &mut tx);
                 class.write_packet(&tx[..len]).await?;
             }
@@ -144,14 +149,18 @@ fn current_state() -> StateReport {
     for (i, slot) in positions.iter_mut().enumerate() {
         *slot = POSITIONS[i].load(Ordering::Relaxed);
     }
-    StateReport { positions, flags: 0 }
+    let mut servos = [0u16; NUM_SERVOS];
+    for (i, slot) in servos.iter_mut().enumerate() {
+        *slot = SERVO_POSITIONS[i].load(Ordering::Relaxed);
+    }
+    StateReport { positions, servos, flags: 0 }
 }
 
 /// Read GCONF + CHOPCONF for `joint` over the TMC2209 UART. Always
-/// produces a report — `ok=false` with zero fields if the bus didn't
+/// produces a report — `ok=false` with zero fields if the chip didn't
 /// answer (bad joint id, timeout, CRC). The host uses this to verify
 /// that the bits a SetTmcConfig requested are actually set on the chip.
-async fn read_tmc_config(bus: &'static DriverBus, joint: u8) -> TmcConfigReport {
+async fn read_tmc_config(drivers: &'static Drivers, joint: u8) -> TmcConfigReport {
     fn err_status(e: DriverError) -> u8 {
         match e {
             DriverError::Uart => TmcConfigStatus::UartError as u8,
@@ -176,7 +185,7 @@ async fn read_tmc_config(bus: &'static DriverBus, joint: u8) -> TmcConfigReport 
     // that came back (or didn't). CHOPCONF is read normally — if GCONF
     // already failed we never get here, and the GCONF trace is the
     // diagnostic we care about for "is the bus alive at all?".
-    let (g_res, rx_trace, rx_count) = bus.read_register_traced::<reg::GCONF>(j).await;
+    let (g_res, rx_trace, rx_count) = drivers.read_register_traced::<reg::GCONF>(j).await;
     let gconf: u32 = match g_res {
         Ok(g) => g.into(),
         Err(e) => {
@@ -186,7 +195,7 @@ async fn read_tmc_config(bus: &'static DriverBus, joint: u8) -> TmcConfigReport 
             };
         }
     };
-    let chopconf = match bus.read_register::<reg::CHOPCONF>(j).await {
+    let chopconf = match drivers.read_register::<reg::CHOPCONF>(j).await {
         Ok(c) => c.into(),
         Err(e) => {
             defmt::warn!("read CHOPCONF j{} failed: {:?}", joint, e);

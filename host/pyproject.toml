@@ -1,0 +1,22 @@
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.dependencies]
+python = ">=3.11"
+pyserial = ">=3.5,<4"
+
+[tool.pixi.pypi-dependencies]
+textual = ">=0.83"
+python-fasthtml = ">=0.14.1,<0.15"
+# IK + URDF pipeline. ikpy reads URDFs directly and is pure-Python; numpy is
+# its hard dep. onshape-to-robot is optional but the documented path for
+# exporting URDF from Onshape CAD.
+ikpy = ">=3.3"
+numpy = ">=1.26"
+
+[tool.pixi.tasks]
+test = "python test.py"
+tui = "python tui.py"
+web = "python web.py"
+ik = "python ik.py"

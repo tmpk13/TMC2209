@@ -1,0 +1,1491 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>TMC2209 Arm Control</title>
+<script src="https://cdn.jsdelivr.net/npm/p5@1.10.0/lib/p5.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0;
+    background: #111;
+    color: #ddd;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: clamp(11px, 1vw, 14px);
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 34vw;
+    gap: 1vw;
+    padding: 1vw;
+    min-height: 100vh;
+    box-sizing: border-box;
+  }
+  #canvas-wrap {
+    background: #181a1f;
+    border: 1px solid #2a2d33;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+  #side {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-height: 0;
+  }
+  #statusbar {
+    background: #181a1f;
+    border: 1px solid #2a2d33;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  #statusbar .bad { color: #e07a7a; }
+  #statusbar .good { color: #9bd29b; }
+  .tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+    border-bottom: 1px solid #2a2d33;
+  }
+  .tab {
+    background: #181a1f;
+    color: #aaa;
+    border: 1px solid #2a2d33;
+    border-bottom: none;
+    border-radius: 4px 4px 0 0;
+    padding: 5px 10px;
+    cursor: pointer;
+    font: inherit;
+  }
+  .tab:hover { background: #20232a; color: #ddd; }
+  .tab.active {
+    background: #20232a;
+    color: #8ab4f8;
+    border-color: #3a4250;
+  }
+  .panel {
+    background: #181a1f;
+    border: 1px solid #2a2d33;
+    border-top: none;
+    border-radius: 0 0 6px 6px;
+    padding: 10px 12px;
+    flex: 1 1 auto;
+    overflow-y: auto;
+    min-height: 0;
+  }
+  .tab-page { display: none; }
+  .tab-page.active { display: block; }
+  h2 {
+    font-size: 11px;
+    margin: 8px 0 6px 0;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #8ab4f8;
+  }
+  h2:first-child { margin-top: 0; }
+  .row { display: flex; align-items: center; gap: 6px; margin: 3px 0; flex-wrap: wrap; }
+  .row label { color: #aaa; }
+  .row.head { color: #777; font-size: 10px; text-transform: uppercase;
+              letter-spacing: 0.06em; margin-top: 8px; }
+  input[type="number"], input[type="text"] {
+    background: #0d0f13;
+    color: #ddd;
+    border: 1px solid #2a2d33;
+    border-radius: 3px;
+    padding: 2px 5px;
+    font: inherit;
+    width: 80px;
+  }
+  input[type="text"] { width: 140px; }
+  button {
+    background: #2a2d33;
+    color: #ddd;
+    border: 1px solid #3a3d44;
+    border-radius: 3px;
+    padding: 3px 9px;
+    font: inherit;
+    cursor: pointer;
+  }
+  button:hover { background: #353940; }
+  button.danger { background: #4a1f1f; border-color: #6a2c2c; }
+  button.go     { background: #1f3f2a; border-color: #2c5a3c; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .grid-joints {
+    display: grid;
+    grid-template-columns: 28px repeat(2, 1fr);
+    gap: 4px;
+    align-items: center;
+    margin: 2px 0;
+  }
+  .grid-joints .name { color: #8ab4f8; font-weight: bold; }
+  .grid-joints .pos  { color: #9bd29b; }
+  .grid-joints .tgt  { color: #e0c87a; }
+  .joint-block {
+    border: 1px solid #2a2d33;
+    border-radius: 4px;
+    padding: 6px 8px;
+    margin-bottom: 6px;
+  }
+  .joint-block .title {
+    color: #8ab4f8;
+    font-weight: bold;
+    margin-bottom: 4px;
+  }
+  .jog-row button { padding: 2px 6px; min-width: 38px; }
+  .badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: #2a2d33;
+    color: #888;
+    font-size: 10px;
+  }
+  .badge.ok  { background: #1f3f2a; color: #a3d9a3; }
+  .badge.bad { background: #4a1f1f; color: #e07a7a; }
+  .badge.warn{ background: #3a2d1f; color: #e0c87a; }
+  kbd {
+    background: #0d0f13;
+    border: 1px solid #2a2d33;
+    border-radius: 3px;
+    padding: 0 3px;
+    font-size: 10px;
+  }
+  .hint { font-size: 10px; color: #888; line-height: 1.4; }
+</style>
+</head>
+<body>
+
+<div id="canvas-wrap"></div>
+
+<div id="side">
+  <div id="statusbar">
+    <div id="status" class="bad">connecting...</div>
+    <div id="fw-version">fw: ?</div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab active" data-tab="arm">Arm</button>
+    <button class="tab" data-tab="joints">Joints</button>
+    <button class="tab" data-tab="servos">Servos</button>
+    <button class="tab" data-tab="tmc">TMC</button>
+    <button class="tab" data-tab="ik">IK</button>
+    <button class="tab" data-tab="options">Options</button>
+  </div>
+
+  <div class="panel">
+
+    <!-- ============ Arm tab ============ -->
+    <div class="tab-page active" data-tab="arm">
+      <h2>Quick controls</h2>
+      <div class="row">
+        <button id="enable-all">enable all</button>
+        <button id="disable-all" class="danger">disable</button>
+        <button id="zero-targets">home (0)</button>
+        <button id="stop-all" class="danger">stop</button>
+      </div>
+      <div class="row">
+        <label>vmax</label>
+        <input id="vmax" type="number" min="1" step="100" value="10000" />
+        <label>amax</label>
+        <input id="amax" type="number" min="1" step="50" value="300" />
+        <button id="apply-speeds">apply</button>
+      </div>
+      <div class="row head">enable</div>
+      <div class="row" id="enable-checks"></div>
+
+      <h2>Live state</h2>
+      <div class="row head"><span style="flex:0 0 28px"></span><span style="flex:1">position</span><span style="flex:1">target</span></div>
+      <div id="joints-summary"></div>
+      <div class="row head" style="margin-top:6px">servo positions (us)</div>
+      <div id="servos-summary"></div>
+
+      <h2>Canvas / drag</h2>
+      <div class="row">
+        <label>link vw</label>
+        <input id="link-vw" type="number" min="2" max="25" step="0.5" value="10" />
+      </div>
+      <div class="row">
+        <label>IK drag</label>
+        <label><input id="ik-enable" type="checkbox" /> drag tip to solve</label>
+        <label>iters</label>
+        <input id="ik-iters" type="number" min="1" max="50" step="1" value="12" style="width:50px" />
+      </div>
+      <div class="hint">
+        Drag joints in the canvas; <kbd>shift</kbd> snaps to 15&deg;. <kbd>0</kbd>
+        homes, <kbd>space</kbd> stops. <b>Middle-drag</b> pans, <b>scroll</b>
+        zooms. The canvas visualises the first three linkages only (J0..J2);
+        J3 (base rotation) and J4 (linear stage) live in the Joints tab.
+      </div>
+    </div>
+
+    <!-- ============ Joints tab ============ -->
+    <div class="tab-page" data-tab="joints">
+      <h2>Per-joint jog &amp; targets</h2>
+      <div class="hint">
+        Click a jog button to nudge by the selected size. The "go" button
+        sends the absolute target value in the input next to it. The "set"
+        button under each joint re-labels that microstep value as the
+        current position without commanding any motion.
+      </div>
+      <div class="row">
+        <label>jog</label>
+        <span id="jog-buttons"></span>
+      </div>
+      <div id="joints-detail"></div>
+    </div>
+
+    <!-- ============ Servos tab ============ -->
+    <div class="tab-page" data-tab="servos">
+      <h2>End-effector servos</h2>
+      <div class="hint">
+        Pulse widths are in microseconds. Deadzone ignores moves smaller
+        than the listed us; speed limits how fast the commanded pulse slews
+        to the target. The "home on enable" flag tells the firmware to
+        snap the target to <i>home us</i> on the next config push - useful
+        for safe startup.
+      </div>
+      <div id="servos-detail"></div>
+    </div>
+
+    <!-- ============ TMC tab ============ -->
+    <div class="tab-page" data-tab="tmc">
+      <h2>TMC2209 config (UART)</h2>
+      <div class="hint">
+        Toggling a switch sends SetTmcConfig (tag 0x05); the badge reads
+        GCONF+CHOPCONF back over UART (tag 0x07) so you can confirm the
+        chip actually latched the change. <b>J4</b> sits in standalone
+        mode (no UART driver) and is therefore not shown here.
+      </div>
+      <div id="tmc-detail"></div>
+    </div>
+
+    <!-- ============ IK tab ============ -->
+    <div class="tab-page" data-tab="ik">
+      <h2>URDF inverse kinematics</h2>
+      <div class="hint">
+        Loads a URDF + motor map (defaults to <code>host/urdf/robot.urdf</code>
+        and <code>host/urdf/motor_map.json</code>) and solves IK with ikpy.
+        Coordinates are in metres, robot base frame.
+      </div>
+      <div class="row">
+        <label>urdf</label>
+        <input id="ik-urdf" type="text" placeholder="(default)" style="width:240px" />
+      </div>
+      <div class="row">
+        <label>map</label>
+        <input id="ik-map" type="text" placeholder="(default)" style="width:240px" />
+        <button id="ik-load">load</button>
+        <span id="ik-status" class="badge">unloaded</span>
+      </div>
+      <h2>Solve</h2>
+      <div class="row">
+        <label>X</label><input id="ik-x" type="number" step="0.01" value="0.0" />
+        <label>Y</label><input id="ik-y" type="number" step="0.01" value="0.0" />
+        <label>Z</label><input id="ik-z" type="number" step="0.01" value="0.0" />
+      </div>
+      <div class="row">
+        <button id="ik-solve">solve</button>
+        <button id="ik-send" class="go">solve and send</button>
+      </div>
+      <div class="row head">result</div>
+      <pre id="ik-result" style="background:#0d0f13; padding:6px; border-radius:4px; max-height:200px; overflow:auto; font-size:11px;"></pre>
+    </div>
+
+    <!-- ============ Options tab ============ -->
+    <div class="tab-page" data-tab="options">
+      <h2>Connection</h2>
+      <div class="row">
+        <label>port</label>
+        <input id="port" type="text" value="" style="width:200px" />
+        <button id="reopen">reopen</button>
+      </div>
+
+      <h2>Jog size</h2>
+      <div class="row" id="jog-size-radios"></div>
+
+      <h2>Per-joint ratios (canvas only)</h2>
+      <div class="hint">
+        Used by the canvas to turn microsteps into degrees on screen.
+        Effective microsteps per output revolution = steps/rev x gear.
+      </div>
+      <div class="row head"><span style="flex:0 0 28px"></span><span style="flex:1">steps/rev</span><span style="flex:1">gear ratio</span></div>
+      <div id="joint-ratios"></div>
+
+      <h2>Reset</h2>
+      <div class="row">
+        <button id="reset-view">reset canvas view</button>
+        <button id="clear-store" class="danger">clear saved options</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// == constants ============================================================
+
+let NUM_JOINTS = 5;
+let NUM_SERVOS = 2;
+let TMC_UART_JOINTS = [0, 1, 2, 3];
+
+const TMC_FLAGS = [
+  { sfx: "sc", label: "stealthChop", bit: 1 << 0, on: true  },
+  { sfx: "ip", label: "interpolate", bit: 1 << 1, on: true  },
+  { sfx: "sh", label: "invert dir",  bit: 1 << 2, on: false },
+];
+const DEFAULT_TMC_FLAGS =
+  TMC_FLAGS.reduce((m, f) => m | (f.on ? f.bit : 0), 0);
+
+const JOINT_LABELS = ["J0 link", "J1 link", "J2 link", "J3 base", "J4 lin"];
+const SERVO_FLAG_HOMING = 1 << 0;
+
+const JOG_SIZES = [10, 100, 1000, 3200];
+
+// == persistence ==========================================================
+
+const STORAGE_KEY = "tmc2209-web-config-v2";
+
+function saveConfig() {
+  try {
+    const portEl = document.getElementById("port");
+    const data = {
+      linkVw: ui.linkVw,
+      stepsPerRev: ui.stepsPerRev,
+      gearRatio: ui.gearRatio,
+      tmcFlags: ui.tmcFlags,
+      ikEnabled: ui.ikEnabled,
+      ikIters: ui.ikIters,
+      view: ui.view,
+      port: portEl ? portEl.value : "",
+      jogSize: ui.jogSize,
+      activeTab: ui.activeTab,
+      ikUrdf: document.getElementById("ik-urdf")?.value || "",
+      ikMap: document.getElementById("ik-map")?.value || "",
+      ikXYZ: [
+        +document.getElementById("ik-x")?.value || 0,
+        +document.getElementById("ik-y")?.value || 0,
+        +document.getElementById("ik-z")?.value || 0,
+      ],
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  } catch (e) { /* ignore */ }
+}
+
+function loadConfig() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return;
+    const d = JSON.parse(raw);
+    if (typeof d.linkVw === "number") ui.linkVw = d.linkVw;
+    if (Array.isArray(d.stepsPerRev)) ui.stepsPerRev = d.stepsPerRev.slice();
+    if (Array.isArray(d.gearRatio))   ui.gearRatio   = d.gearRatio.slice();
+    if (Array.isArray(d.tmcFlags))    ui.tmcFlags    = d.tmcFlags.slice();
+    if (typeof d.ikEnabled === "boolean") ui.ikEnabled = d.ikEnabled;
+    if (typeof d.ikIters === "number") ui.ikIters = d.ikIters;
+    if (typeof d.jogSize === "number") ui.jogSize = d.jogSize;
+    if (typeof d.activeTab === "string") ui.activeTab = d.activeTab;
+    if (d.view && typeof d.view.scale === "number") {
+      ui.view.offsetX = +d.view.offsetX || 0;
+      ui.view.offsetY = +d.view.offsetY || 0;
+      ui.view.scale   = Math.max(0.1, Math.min(10, +d.view.scale || 1));
+    }
+    window._savedPort = typeof d.port === "string" ? d.port : "";
+    window._savedIkUrdf = typeof d.ikUrdf === "string" ? d.ikUrdf : "";
+    window._savedIkMap  = typeof d.ikMap  === "string" ? d.ikMap  : "";
+    window._savedIkXYZ  = Array.isArray(d.ikXYZ) ? d.ikXYZ : null;
+  } catch (e) { /* ignore */ }
+}
+
+// == state ================================================================
+
+const state = {
+  positions: Array(NUM_JOINTS).fill(0),
+  targets:   Array(NUM_JOINTS).fill(0),
+  servo_positions: Array(NUM_SERVOS).fill(1500),
+  servo_targets:   Array(NUM_SERVOS).fill(1500),
+  servo_configs: Array(NUM_SERVOS).fill(null).map(() => defaultServoCfg()),
+  enable_mask: 0,
+  connected: false,
+  err: "",
+  vmax: 10000,
+  amax: 300,
+  ik: { loaded: false, error: null },
+};
+
+function defaultServoCfg() {
+  return {
+    min_us: 500, max_us: 2500, deadzone_us: 5,
+    speed_us_per_s: 1000, home_us: 1500, flags: SERVO_FLAG_HOMING,
+  };
+}
+
+const ui = {
+  linkVw: 10,
+  stepsPerRev: Array(NUM_JOINTS).fill(3200),
+  gearRatio:   Array(NUM_JOINTS).fill(1),
+  dragAngles:  [null, null, null],
+  draggingJoint: -1,
+  pendingTargets: Array(NUM_JOINTS).fill(null),
+  pendingServos:  Array(NUM_SERVOS).fill(null),
+  ikEnabled: false,
+  ikIters: 12,
+  tmcFlags: Array(NUM_JOINTS).fill(DEFAULT_TMC_FLAGS),
+  view: { offsetX: 0, offsetY: 0, scale: 1.0 },
+  panning: false,
+  panLast: { x: 0, y: 0 },
+  jogSize: 100,
+  activeTab: "arm",
+  servoConfigDirty: Array(NUM_SERVOS).fill(false),
+};
+loadConfig();
+
+function linkLenPx()    { return Math.max(20, (ui.linkVw / 100) * window.innerWidth); }
+function effectiveLen() { return linkLenPx() * ui.view.scale; }
+function effectiveBase() {
+  return {
+    x: canvasSize.w / 2 + ui.view.offsetX,
+    y: canvasSize.h / 2 + ui.view.offsetY,
+  };
+}
+function stepsPerRad(j) { return (ui.stepsPerRev[j] * ui.gearRatio[j]) / (2 * Math.PI); }
+function radFromSteps(j, s) { return s / stepsPerRad(j); }
+function stepsFromRad(j, r) { return Math.round(r * stepsPerRad(j)); }
+
+// == net ==================================================================
+
+async function postJSON(path, body) {
+  try {
+    const r = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return await r.json();
+  } catch (e) { return null; }
+}
+
+let _syncedOnConnect = false;
+async function pollState() {
+  try {
+    const r = await fetch("/state", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const s = await r.json();
+    state.positions = s.positions;
+    state.targets   = s.targets;
+    state.servo_positions = s.servo_positions;
+    state.servo_targets   = s.servo_targets;
+    state.servo_configs   = s.servo_configs;
+    state.enable_mask = s.enable_mask;
+    state.connected = s.connected;
+    state.err = s.error || "";
+    state.vmax = s.vmax;
+    state.amax = s.amax;
+    state.port = s.port;
+    state.version = s.version;
+    state.ik = s.ik || { loaded: false };
+    if (s.num_joints && s.num_joints !== NUM_JOINTS) {
+      NUM_JOINTS = s.num_joints;
+    }
+    if (s.num_servos && s.num_servos !== NUM_SERVOS) {
+      NUM_SERVOS = s.num_servos;
+    }
+    if (Array.isArray(s.tmc_uart_joints)) TMC_UART_JOINTS = s.tmc_uart_joints;
+    renderAll();
+    if (state.connected && !_syncedOnConnect) {
+      _syncedOnConnect = true;
+      for (const j of TMC_UART_JOINTS) {
+        (async (jj) => {
+          await postJSON("/tmc", { joint: jj, flags: ui.tmcFlags[jj] });
+          await verifyTmc(jj);
+        })(j);
+      }
+    } else if (!state.connected) {
+      _syncedOnConnect = false;
+      for (let j = 0; j < NUM_JOINTS; j++) {
+        tmcVerify[j] = null;
+        tmcDetail[j] = "";
+      }
+      paintAllTmcBadges();
+    }
+  } catch (e) {
+    state.connected = false;
+    state.err = e.message;
+    renderAll();
+  }
+}
+setInterval(pollState, 100);
+
+// Throttled outgoing joints + servos
+setInterval(() => {
+  for (let j = 0; j < NUM_JOINTS; j++) {
+    const t = ui.pendingTargets[j];
+    if (t !== null) {
+      ui.pendingTargets[j] = null;
+      postJSON("/target", { joint: j, position: t });
+    }
+  }
+  for (let s = 0; s < NUM_SERVOS; s++) {
+    const t = ui.pendingServos[s];
+    if (t !== null) {
+      ui.pendingServos[s] = null;
+      postJSON("/servo/target", { servo: s, target_us: t });
+    }
+  }
+}, 25);
+
+function queueTarget(joint, steps) { ui.pendingTargets[joint] = steps; }
+function queueServoTarget(servo, us) { ui.pendingServos[servo] = us; }
+
+// == tabs =================================================================
+
+document.querySelectorAll(".tab").forEach((el) => {
+  el.addEventListener("click", () => {
+    const name = el.dataset.tab;
+    document.querySelectorAll(".tab").forEach((t) =>
+      t.classList.toggle("active", t.dataset.tab === name));
+    document.querySelectorAll(".tab-page").forEach((p) =>
+      p.classList.toggle("active", p.dataset.tab === name));
+    ui.activeTab = name;
+    saveConfig();
+  });
+});
+// Apply restored active tab.
+if (ui.activeTab && ui.activeTab !== "arm") {
+  const t = document.querySelector(`.tab[data-tab="${ui.activeTab}"]`);
+  if (t) t.click();
+}
+
+// == top-of-arm-tab handlers ==============================================
+
+document.getElementById("enable-all").addEventListener("click", () => {
+  postJSON("/enable", { mask: (1 << NUM_JOINTS) - 1 });
+});
+document.getElementById("disable-all").addEventListener("click", () => {
+  postJSON("/enable", { mask: 0 });
+});
+document.getElementById("zero-targets").addEventListener("click", () => {
+  const targets = [];
+  for (let j = 0; j < NUM_JOINTS; j++) targets.push({ joint: j, position: 0 });
+  postJSON("/targets", { targets });
+});
+document.getElementById("stop-all").addEventListener("click", () => {
+  postJSON("/targets", { targets: state.positions.map((p, j) => ({ joint: j, position: p })) });
+});
+["vmax", "amax"].forEach((id) => {
+  document.getElementById(id).addEventListener("input", (e) => { e.target.dataset.dirty = "1"; });
+});
+document.getElementById("apply-speeds").addEventListener("click", () => {
+  const v = Number(document.getElementById("vmax").value) || 1;
+  const a = Number(document.getElementById("amax").value) || 1;
+  postJSON("/speeds", { vmax: v, amax: a });
+  delete document.getElementById("vmax").dataset.dirty;
+  delete document.getElementById("amax").dataset.dirty;
+});
+document.getElementById("link-vw").addEventListener("input", (e) => {
+  ui.linkVw = Math.max(2, Math.min(25, Number(e.target.value) || 10));
+  saveConfig();
+});
+document.getElementById("ik-enable").addEventListener("change", (e) => {
+  ui.ikEnabled = e.target.checked;
+  saveConfig();
+});
+document.getElementById("ik-iters").addEventListener("input", (e) => {
+  ui.ikIters = Math.max(1, Math.min(50, Number(e.target.value) || 12));
+  saveConfig();
+});
+
+// == Options tab ==========================================================
+
+document.getElementById("port").addEventListener("input", (e) => {
+  e.target.dataset.dirty = "1";
+  saveConfig();
+});
+document.getElementById("reopen").addEventListener("click", async () => {
+  const portEl = document.getElementById("port");
+  const port = (portEl.value || "").trim() || null;
+  await postJSON("/reopen", { port });
+  delete portEl.dataset.dirty;
+  saveConfig();
+  pollState();
+});
+document.getElementById("reset-view").addEventListener("click", () => {
+  ui.view.offsetX = 0; ui.view.offsetY = 0; ui.view.scale = 1.0;
+  saveConfig();
+});
+document.getElementById("clear-store").addEventListener("click", () => {
+  if (!confirm("Clear all saved options?")) return;
+  localStorage.removeItem(STORAGE_KEY);
+  location.reload();
+});
+
+(function buildJogSizeRadios() {
+  const host = document.getElementById("jog-size-radios");
+  host.innerHTML = "";
+  for (const sz of JOG_SIZES) {
+    const id = `jogsz-${sz}`;
+    const lab = document.createElement("label");
+    lab.innerHTML =
+      `<input type="radio" name="jogsz" id="${id}" value="${sz}"` +
+      (sz === ui.jogSize ? " checked" : "") +
+      `/> ${sz}`;
+    host.appendChild(lab);
+  }
+  host.querySelectorAll("input[name='jogsz']").forEach((el) => {
+    el.addEventListener("change", () => {
+      ui.jogSize = Number(el.value);
+      saveConfig();
+      renderJogButtons();
+    });
+  });
+})();
+
+function renderRatios() {
+  const host = document.getElementById("joint-ratios");
+  host.innerHTML = "";
+  for (let j = 0; j < NUM_JOINTS; j++) {
+    const row = document.createElement("div");
+    row.className = "grid-joints";
+    row.innerHTML = `
+      <span class="name">J${j}</span>
+      <input type="number" class="spr" data-j="${j}" min="200" step="200" value="${ui.stepsPerRev[j] || 3200}" />
+      <input type="number" class="gear" data-j="${j}" min="0.001" step="0.1" value="${ui.gearRatio[j] || 1}" />
+    `;
+    host.appendChild(row);
+  }
+  host.querySelectorAll("input.spr").forEach((el) => {
+    el.addEventListener("input", (e) => {
+      ui.stepsPerRev[Number(e.target.dataset.j)] =
+        Math.max(1, Number(e.target.value) || 3200);
+      saveConfig();
+    });
+  });
+  host.querySelectorAll("input.gear").forEach((el) => {
+    el.addEventListener("input", (e) => {
+      ui.gearRatio[Number(e.target.dataset.j)] =
+        Math.max(0.001, Number(e.target.value) || 1);
+      saveConfig();
+    });
+  });
+}
+
+// == Joints tab ===========================================================
+
+function renderJogButtons() {
+  const host = document.getElementById("jog-buttons");
+  host.innerHTML = "";
+  for (const sz of JOG_SIZES) {
+    const b = document.createElement("button");
+    b.textContent = String(sz);
+    b.className = (sz === ui.jogSize) ? "go" : "";
+    b.addEventListener("click", () => {
+      ui.jogSize = sz;
+      saveConfig();
+      // Refresh the highlight + the matching radio.
+      renderJogButtons();
+      const r = document.getElementById(`jogsz-${sz}`);
+      if (r) r.checked = true;
+    });
+    host.appendChild(b);
+  }
+}
+
+function renderJointsDetail() {
+  const host = document.getElementById("joints-detail");
+  if (host.childElementCount === NUM_JOINTS) {
+    for (let j = 0; j < NUM_JOINTS; j++) {
+      host.querySelector(`#jpos-${j}`).textContent =
+        `pos ${state.positions[j].toString().padStart(7, " ")}`;
+      host.querySelector(`#jtgt-${j}`).textContent =
+        `tgt ${state.targets[j].toString().padStart(7, " ")}`;
+      const setEl = host.querySelector(`#setpos-${j}`);
+      if (setEl && !setEl.dataset.dirty) setEl.value = state.positions[j];
+      const tgtEl = host.querySelector(`#tgtinp-${j}`);
+      if (tgtEl && !tgtEl.dataset.dirty) tgtEl.value = state.targets[j];
+    }
+    return;
+  }
+  host.innerHTML = "";
+  for (let j = 0; j < NUM_JOINTS; j++) {
+    const block = document.createElement("div");
+    block.className = "joint-block";
+    block.innerHTML = `
+      <div class="title">${JOINT_LABELS[j] || ("J" + j)}</div>
+      <div class="row">
+        <span class="pos" id="jpos-${j}">pos ?</span>
+        <span class="tgt" id="jtgt-${j}">tgt ?</span>
+      </div>
+      <div class="row jog-row" id="jogrow-${j}"></div>
+      <div class="row">
+        <button class="home" data-j="${j}">home</button>
+        <button class="stop danger" data-j="${j}">stop</button>
+        <label>target</label>
+        <input type="number" id="tgtinp-${j}" step="1" value="0" />
+        <button class="go gobtn" data-j="${j}">go</button>
+      </div>
+      <div class="row">
+        <label>set pos</label>
+        <input type="number" id="setpos-${j}" step="1" value="0" />
+        <button class="setpos-go" data-j="${j}">set</button>
+        <span class="hint">re-labels current microstep count without motion</span>
+      </div>
+    `;
+    host.appendChild(block);
+    // Jog row: -3200 -1000 -100 -10 | +10 +100 +1000 +3200
+    const jr = block.querySelector(`#jogrow-${j}`);
+    for (const sz of [...JOG_SIZES].reverse()) jr.appendChild(jogBtn(j, -sz));
+    for (const sz of JOG_SIZES) jr.appendChild(jogBtn(j, +sz));
+  }
+  host.querySelectorAll("button.home").forEach((el) =>
+    el.addEventListener("click", () => {
+      postJSON("/target", { joint: Number(el.dataset.j), position: 0 });
+    }));
+  host.querySelectorAll("button.stop").forEach((el) =>
+    el.addEventListener("click", () => {
+      const j = Number(el.dataset.j);
+      postJSON("/target", { joint: j, position: state.positions[j] });
+    }));
+  host.querySelectorAll("button.gobtn").forEach((el) =>
+    el.addEventListener("click", () => {
+      const j = Number(el.dataset.j);
+      const inp = host.querySelector(`#tgtinp-${j}`);
+      const pos = Number(inp.value) || 0;
+      delete inp.dataset.dirty;
+      postJSON("/target", { joint: j, position: pos });
+    }));
+  host.querySelectorAll("input[id^='tgtinp-']").forEach((el) => {
+    el.addEventListener("input", () => { el.dataset.dirty = "1"; });
+    el.addEventListener("blur",  () => { delete el.dataset.dirty; });
+  });
+  host.querySelectorAll("input[id^='setpos-']").forEach((el) => {
+    el.addEventListener("input", () => { el.dataset.dirty = "1"; });
+    el.addEventListener("blur",  () => { delete el.dataset.dirty; });
+  });
+  host.querySelectorAll("button.setpos-go").forEach((el) =>
+    el.addEventListener("click", () => {
+      const j = Number(el.dataset.j);
+      const inp = host.querySelector(`#setpos-${j}`);
+      const pos = Number(inp.value) || 0;
+      delete inp.dataset.dirty;
+      postJSON("/set_position", { joint: j, position: pos });
+    }));
+}
+
+function jogBtn(j, delta) {
+  const b = document.createElement("button");
+  b.textContent = (delta > 0 ? "+" : "") + delta;
+  b.addEventListener("click", () => {
+    const pos = state.targets[j] + delta;
+    postJSON("/target", { joint: j, position: pos });
+  });
+  return b;
+}
+
+// == Servos tab ===========================================================
+
+const SERVO_FIELDS = [
+  { key: "min_us", label: "min us", step: 10 },
+  { key: "max_us", label: "max us", step: 10 },
+  { key: "deadzone_us", label: "deadzone", step: 1 },
+  { key: "speed_us_per_s", label: "speed us/s", step: 50 },
+  { key: "home_us", label: "home us", step: 10 },
+];
+
+function renderServosDetail() {
+  const host = document.getElementById("servos-detail");
+  if (host.childElementCount === NUM_SERVOS) {
+    for (let s = 0; s < NUM_SERVOS; s++) {
+      host.querySelector(`#spos-${s}`).textContent =
+        `pos ${state.servo_positions[s]} us`;
+      host.querySelector(`#stgt-${s}`).textContent =
+        `tgt ${state.servo_targets[s]} us`;
+      // Only refresh form values when not dirty - otherwise the user's typing
+      // gets stomped by every poll tick.
+      if (!ui.servoConfigDirty[s]) {
+        const cfg = state.servo_configs[s] || defaultServoCfg();
+        for (const f of SERVO_FIELDS) {
+          const el = host.querySelector(`#s${s}-${f.key}`);
+          if (el && document.activeElement !== el) el.value = cfg[f.key];
+        }
+        const hflag = host.querySelector(`#s${s}-homing`);
+        if (hflag) hflag.checked = !!(cfg.flags & SERVO_FLAG_HOMING);
+      }
+    }
+    return;
+  }
+  host.innerHTML = "";
+  for (let s = 0; s < NUM_SERVOS; s++) {
+    const cfg = state.servo_configs[s] || defaultServoCfg();
+    const block = document.createElement("div");
+    block.className = "joint-block";
+    let cfgRows = "";
+    for (const f of SERVO_FIELDS) {
+      cfgRows += `<label>${f.label}</label><input type="number" id="s${s}-${f.key}" step="${f.step}" value="${cfg[f.key]}" /> `;
+    }
+    block.innerHTML = `
+      <div class="title">Servo ${s}</div>
+      <div class="row">
+        <span class="pos" id="spos-${s}">pos ?</span>
+        <span class="tgt" id="stgt-${s}">tgt ?</span>
+      </div>
+      <div class="row">
+        <button class="srv-jog" data-s="${s}" data-d="-100">-100</button>
+        <button class="srv-jog" data-s="${s}" data-d="-10">-10</button>
+        <button class="srv-jog" data-s="${s}" data-d="10">+10</button>
+        <button class="srv-jog" data-s="${s}" data-d="100">+100</button>
+        <button class="srv-home" data-s="${s}">home</button>
+        <label>target us</label>
+        <input type="number" id="stgtinp-${s}" step="1" value="${state.servo_targets[s]}" />
+        <button class="srv-go go" data-s="${s}">go</button>
+      </div>
+      <div class="row" id="cfg-${s}">${cfgRows}</div>
+      <div class="row">
+        <label><input type="checkbox" id="s${s}-homing"
+                ${cfg.flags & SERVO_FLAG_HOMING ? "checked" : ""}/> home on enable</label>
+        <button class="srv-apply go" data-s="${s}">apply config</button>
+      </div>
+    `;
+    host.appendChild(block);
+  }
+  host.querySelectorAll("button.srv-jog").forEach((el) =>
+    el.addEventListener("click", () => {
+      const s = Number(el.dataset.s);
+      const d = Number(el.dataset.d);
+      queueServoTarget(s, state.servo_targets[s] + d);
+    }));
+  host.querySelectorAll("button.srv-home").forEach((el) =>
+    el.addEventListener("click", () => {
+      const s = Number(el.dataset.s);
+      const cfg = state.servo_configs[s] || defaultServoCfg();
+      queueServoTarget(s, cfg.home_us);
+    }));
+  host.querySelectorAll("button.srv-go").forEach((el) =>
+    el.addEventListener("click", () => {
+      const s = Number(el.dataset.s);
+      const inp = host.querySelector(`#stgtinp-${s}`);
+      queueServoTarget(s, Number(inp.value) || 0);
+    }));
+  // Mark config inputs as dirty so the poll loop doesn't overwrite them.
+  for (let s = 0; s < NUM_SERVOS; s++) {
+    SERVO_FIELDS.forEach((f) => {
+      const el = host.querySelector(`#s${s}-${f.key}`);
+      if (!el) return;
+      el.addEventListener("input", () => { ui.servoConfigDirty[s] = true; });
+    });
+    const homing = host.querySelector(`#s${s}-homing`);
+    if (homing) homing.addEventListener("change", () => { ui.servoConfigDirty[s] = true; });
+  }
+  host.querySelectorAll("button.srv-apply").forEach((el) =>
+    el.addEventListener("click", async () => {
+      const s = Number(el.dataset.s);
+      const cfg = {};
+      for (const f of SERVO_FIELDS) {
+        const v = host.querySelector(`#s${s}-${f.key}`);
+        cfg[f.key] = Math.max(0, Number(v.value) || 0);
+      }
+      cfg.flags = host.querySelector(`#s${s}-homing`).checked ? SERVO_FLAG_HOMING : 0;
+      await postJSON("/servo/config", { servo: s, config: cfg });
+      ui.servoConfigDirty[s] = false;
+    }));
+}
+
+// == TMC tab ==============================================================
+
+const tmcVerify = Array(8).fill(null);
+const tmcDetail = Array(8).fill("");
+
+const GCONF_EN_SPREAD_CYCLE = 1 << 2;
+const GCONF_SHAFT           = 1 << 4;
+const CHOPCONF_INTPOL       = 1 << 28;
+
+function flagsFromReadback(gconf, chopconf) {
+  let f = 0;
+  if (!(gconf & GCONF_EN_SPREAD_CYCLE)) f |= 1 << 0;
+  if (chopconf & CHOPCONF_INTPOL)       f |= 1 << 1;
+  if (gconf & GCONF_SHAFT)              f |= 1 << 2;
+  return f;
+}
+
+function renderTmcDetail() {
+  const host = document.getElementById("tmc-detail");
+  if (host.childElementCount === TMC_UART_JOINTS.length) {
+    paintAllTmcBadges();
+    return;
+  }
+  host.innerHTML = "";
+  for (const j of TMC_UART_JOINTS) {
+    const row = document.createElement("div");
+    row.className = "joint-block";
+    let html = `<div class="title">${JOINT_LABELS[j] || ("J" + j)}</div><div class="row">`;
+    for (const f of TMC_FLAGS) {
+      const checked = (ui.tmcFlags[j] & f.bit) ? "checked" : "";
+      html += `<label><input type="checkbox" class="tmc" data-j="${j}" data-bit="${f.bit}" ${checked}/> ${f.label}</label>`;
+    }
+    html += `<span class="badge tmc-badge" data-j="${j}" title="readback">?</span>`;
+    html += `<button class="tmc-verify" data-j="${j}">verify</button>`;
+    html += `</div>`;
+    row.innerHTML = html;
+    host.appendChild(row);
+  }
+  host.querySelectorAll("input.tmc").forEach((el) =>
+    el.addEventListener("change", async (e) => {
+      const j = Number(e.target.dataset.j);
+      const bit = Number(e.target.dataset.bit);
+      if (e.target.checked) ui.tmcFlags[j] |= bit;
+      else                  ui.tmcFlags[j] &= ~bit;
+      await postJSON("/tmc", { joint: j, flags: ui.tmcFlags[j] });
+      saveConfig();
+      verifyTmc(j);
+    }));
+  host.querySelectorAll("button.tmc-verify").forEach((el) =>
+    el.addEventListener("click", () => verifyTmc(Number(el.dataset.j))));
+  paintAllTmcBadges();
+}
+
+function paintAllTmcBadges() {
+  for (const j of TMC_UART_JOINTS) paintTmcBadge(j);
+}
+
+function paintTmcBadge(j) {
+  const el = document.querySelector(`.tmc-badge[data-j="${j}"]`);
+  if (!el) return;
+  el.title = tmcDetail[j] || "readback";
+  el.classList.remove("ok", "bad", "warn");
+  const v = tmcVerify[j];
+  if (v === "ok")        { el.textContent = "ok";    el.classList.add("ok"); }
+  else if (v === "bad")  { el.textContent = "diff";  el.classList.add("bad"); }
+  else if (v === "noread"){ el.textContent = "no rd"; el.classList.add("warn"); }
+  else if (v === "oldfw"){ el.textContent = "old fw"; el.classList.add("warn"); }
+  else                   { el.textContent = "?"; }
+}
+
+async function verifyTmc(j) {
+  const d = await postJSON("/verify_tmc", { joint: j });
+  if (!d) { tmcVerify[j] = "noread"; tmcDetail[j] = "network error"; }
+  else if (!d.ok) {
+    if (d.reason === "no_reply") {
+      tmcVerify[j] = "oldfw";
+      tmcDetail[j] = "firmware did not reply - probably needs reflash";
+    } else {
+      tmcVerify[j] = "noread";
+      const trace = (d.rx_count > 0)
+        ? `rx=${d.rx_count}B [${d.rx_hex}]`
+        : "rx=0B (chip silent)";
+      tmcDetail[j] = `${d.status_name || "unknown"} - ${trace}`;
+    }
+  } else {
+    const actual = flagsFromReadback(d.gconf, d.chopconf);
+    const mask = TMC_FLAGS.reduce((m, f) => m | f.bit, 0);
+    const requested = ui.tmcFlags[j] & mask;
+    const got = actual & mask;
+    if (got === requested) {
+      tmcVerify[j] = "ok";
+      tmcDetail[j] = `gconf=0x${d.gconf.toString(16).padStart(8,"0")}` +
+                     ` chopconf=0x${d.chopconf.toString(16).padStart(8,"0")}`;
+    } else {
+      tmcVerify[j] = "bad";
+      tmcDetail[j] = `requested 0b${requested.toString(2).padStart(3,"0")}` +
+                     ` but chip has 0b${got.toString(2).padStart(3,"0")}`;
+    }
+  }
+  paintTmcBadge(j);
+}
+
+// == IK tab ===============================================================
+
+(function initIK() {
+  if (window._savedIkUrdf) document.getElementById("ik-urdf").value = window._savedIkUrdf;
+  if (window._savedIkMap)  document.getElementById("ik-map").value  = window._savedIkMap;
+  if (Array.isArray(window._savedIkXYZ)) {
+    document.getElementById("ik-x").value = window._savedIkXYZ[0];
+    document.getElementById("ik-y").value = window._savedIkXYZ[1];
+    document.getElementById("ik-z").value = window._savedIkXYZ[2];
+  }
+})();
+
+function ikXYZ() {
+  return {
+    x: Number(document.getElementById("ik-x").value) || 0,
+    y: Number(document.getElementById("ik-y").value) || 0,
+    z: Number(document.getElementById("ik-z").value) || 0,
+  };
+}
+
+document.getElementById("ik-load").addEventListener("click", async () => {
+  const body = {
+    urdf: document.getElementById("ik-urdf").value || null,
+    motor_map: document.getElementById("ik-map").value || null,
+  };
+  const r = await postJSON("/ik/load", body);
+  paintIkStatus(r);
+  saveConfig();
+});
+["ik-x", "ik-y", "ik-z", "ik-urdf", "ik-map"].forEach((id) => {
+  document.getElementById(id).addEventListener("input", () => saveConfig());
+});
+
+document.getElementById("ik-solve").addEventListener("click", async () => {
+  const r = await postJSON("/ik/solve", { ...ikXYZ(), send: false });
+  showIkResult(r);
+});
+document.getElementById("ik-send").addEventListener("click", async () => {
+  const r = await postJSON("/ik/solve", { ...ikXYZ(), send: true });
+  showIkResult(r);
+});
+
+function showIkResult(r) {
+  const el = document.getElementById("ik-result");
+  if (!r) { el.textContent = "network error"; return; }
+  el.textContent = JSON.stringify(r, null, 2);
+}
+
+function paintIkStatus(r) {
+  const el = document.getElementById("ik-status");
+  el.classList.remove("ok", "bad", "warn");
+  if (!r) { el.textContent = "error"; el.classList.add("bad"); return; }
+  if (r.ok) { el.textContent = "loaded"; el.classList.add("ok"); }
+  else { el.textContent = r.error || "error"; el.classList.add("bad"); }
+}
+
+// == status + summary =====================================================
+
+function renderStatus() {
+  const st = document.getElementById("status");
+  if (state.connected) {
+    st.textContent = `connected (${state.port || "?"})`;
+    st.className = "good";
+  } else {
+    st.textContent = `disconnected${state.err ? ": " + state.err : ""}`;
+    st.className = "bad";
+  }
+  const portEl = document.getElementById("port");
+  if (portEl && !portEl.dataset.dirty && state.port) portEl.value = state.port;
+
+  const fwEl = document.getElementById("fw-version");
+  if (!state.connected) {
+    fwEl.textContent = "fw: ?";
+    fwEl.className = "";
+  } else if (state.version) {
+    const v = state.version;
+    const built = v.epoch
+      ? new Date(v.epoch * 1000).toISOString().replace("T", " ").slice(0, 19)
+      : "?";
+    fwEl.textContent = `fw: ${v.chip_name} ${v.git} built ${built} UTC`;
+    fwEl.className = "";
+  } else {
+    fwEl.textContent = "fw: unknown (firmware too old)";
+    fwEl.className = "bad";
+  }
+
+  // vmax/amax inputs (only if not currently edited).
+  const vmaxEl = document.getElementById("vmax");
+  const amaxEl = document.getElementById("amax");
+  if (!vmaxEl.dataset.dirty) vmaxEl.value = state.vmax;
+  if (!amaxEl.dataset.dirty) amaxEl.value = state.amax;
+
+  if (state.ik) {
+    const s = document.getElementById("ik-status");
+    s.classList.remove("ok", "bad", "warn");
+    if (state.ik.loaded) { s.textContent = "loaded"; s.classList.add("ok"); }
+    else if (state.ik.error) {
+      s.textContent = state.ik.error;
+      s.classList.add(state.ik.error.startsWith("ikpy") ? "warn" : "bad");
+    } else s.textContent = "unloaded";
+  }
+}
+
+function renderEnableChecks() {
+  const host = document.getElementById("enable-checks");
+  if (host.childElementCount !== NUM_JOINTS) {
+    host.innerHTML = "";
+    for (let j = 0; j < NUM_JOINTS; j++) {
+      const lab = document.createElement("label");
+      lab.innerHTML = `<input type="checkbox" class="en" data-j="${j}" /> J${j}`;
+      host.appendChild(lab);
+    }
+    host.querySelectorAll(".en").forEach((el) =>
+      el.addEventListener("change", () => {
+        let mask = 0;
+        host.querySelectorAll(".en").forEach((e2) => {
+          if (e2.checked) mask |= 1 << Number(e2.dataset.j);
+        });
+        postJSON("/enable", { mask });
+      }));
+  }
+  for (let j = 0; j < NUM_JOINTS; j++) {
+    const en = host.querySelector(`.en[data-j="${j}"]`);
+    if (en) en.checked = !!(state.enable_mask & (1 << j));
+  }
+}
+
+function renderJointsSummary() {
+  const host = document.getElementById("joints-summary");
+  if (host.childElementCount !== NUM_JOINTS) {
+    host.innerHTML = "";
+    for (let j = 0; j < NUM_JOINTS; j++) {
+      const row = document.createElement("div");
+      row.className = "grid-joints";
+      row.innerHTML = `
+        <span class="name">J${j}</span>
+        <span class="pos" id="sm-pos-${j}">pos +0</span>
+        <span class="tgt" id="sm-tgt-${j}">tgt +0</span>`;
+      host.appendChild(row);
+    }
+  }
+  for (let j = 0; j < NUM_JOINTS; j++) {
+    document.getElementById(`sm-pos-${j}`).textContent =
+      `pos ${state.positions[j].toString().padStart(7, " ")}`;
+    document.getElementById(`sm-tgt-${j}`).textContent =
+      `tgt ${state.targets[j].toString().padStart(7, " ")}`;
+  }
+}
+
+function renderServosSummary() {
+  const host = document.getElementById("servos-summary");
+  if (host.childElementCount !== NUM_SERVOS) {
+    host.innerHTML = "";
+    for (let s = 0; s < NUM_SERVOS; s++) {
+      const row = document.createElement("div");
+      row.className = "grid-joints";
+      row.innerHTML = `
+        <span class="name">S${s}</span>
+        <span class="pos" id="sv-pos-${s}">pos ?us</span>
+        <span class="tgt" id="sv-tgt-${s}">tgt ?us</span>`;
+      host.appendChild(row);
+    }
+  }
+  for (let s = 0; s < NUM_SERVOS; s++) {
+    document.getElementById(`sv-pos-${s}`).textContent =
+      `pos ${state.servo_positions[s]}us`;
+    document.getElementById(`sv-tgt-${s}`).textContent =
+      `tgt ${state.servo_targets[s]}us`;
+  }
+}
+
+function renderAll() {
+  renderStatus();
+  renderEnableChecks();
+  renderJointsSummary();
+  renderServosSummary();
+  renderJointsDetail();
+  renderServosDetail();
+  renderTmcDetail();
+  renderRatios();
+}
+renderJogButtons();
+renderRatios();
+renderJointsDetail();
+renderServosDetail();
+renderTmcDetail();
+
+// Top-level inputs and one-off hydrations.
+(function hydrate() {
+  document.getElementById("link-vw").value = ui.linkVw;
+  document.getElementById("ik-enable").checked = ui.ikEnabled;
+  document.getElementById("ik-iters").value = ui.ikIters;
+  const portEl = document.getElementById("port");
+  if (window._savedPort) portEl.value = window._savedPort;
+})();
+
+// == keyboard shortcuts ===================================================
+
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT") return;
+  if (e.key === "0") {
+    const targets = [];
+    for (let j = 0; j < NUM_JOINTS; j++) targets.push({ joint: j, position: 0 });
+    postJSON("/targets", { targets });
+  } else if (e.key === " ") {
+    e.preventDefault();
+    postJSON("/targets", {
+      targets: state.positions.map((p, j) => ({ joint: j, position: p })),
+    });
+  }
+});
+
+// == FABRIK + p5 canvas ===================================================
+
+function solveIK(angles, targetX, targetY, linkLen, iters) {
+  const n = angles.length;
+  const pts = [{ x: 0, y: 0 }];
+  let abs = 0;
+  for (let i = 0; i < n; i++) {
+    abs += angles[i];
+    pts.push({
+      x: pts[i].x + linkLen * Math.cos(abs),
+      y: pts[i].y + linkLen * Math.sin(abs),
+    });
+  }
+  const reach = linkLen * n;
+  const dist = Math.hypot(targetX, targetY);
+  if (dist > reach - 1e-3) {
+    const ang = Math.atan2(targetY, targetX);
+    const out = new Array(n).fill(0);
+    out[0] = ang;
+    return out;
+  }
+  const base = { x: pts[0].x, y: pts[0].y };
+  for (let it = 0; it < iters; it++) {
+    pts[n] = { x: targetX, y: targetY };
+    for (let i = n - 1; i >= 0; i--) {
+      const dx = pts[i].x - pts[i + 1].x;
+      const dy = pts[i].y - pts[i + 1].y;
+      const d = Math.hypot(dx, dy) || 1e-9;
+      pts[i] = {
+        x: pts[i + 1].x + (dx / d) * linkLen,
+        y: pts[i + 1].y + (dy / d) * linkLen,
+      };
+    }
+    pts[0] = { x: base.x, y: base.y };
+    for (let i = 0; i < n; i++) {
+      const dx = pts[i + 1].x - pts[i].x;
+      const dy = pts[i + 1].y - pts[i].y;
+      const d = Math.hypot(dx, dy) || 1e-9;
+      pts[i + 1] = {
+        x: pts[i].x + (dx / d) * linkLen,
+        y: pts[i].y + (dy / d) * linkLen,
+      };
+    }
+  }
+  const out = new Array(n);
+  let prev = 0;
+  for (let i = 0; i < n; i++) {
+    const a = Math.atan2(pts[i + 1].y - pts[i].y, pts[i + 1].x - pts[i].x);
+    let local = a - prev;
+    local = Math.atan2(Math.sin(local), Math.cos(local));
+    out[i] = local;
+    prev = a;
+  }
+  return out;
+}
+
+const CANVAS_JOINTS = 3;  // only J0..J2 are revolute and shown on screen
+let canvasSize = { w: 800, h: 600 };
+
+function jointPositions(angles, base, len) {
+  const pts = [{ x: base.x, y: base.y }];
+  let abs = 0;
+  let p = { x: base.x, y: base.y };
+  for (let j = 0; j < CANVAS_JOINTS; j++) {
+    abs += angles[j];
+    p = { x: p.x + len * Math.cos(abs), y: p.y + len * Math.sin(abs) };
+    pts.push(p);
+  }
+  return pts;
+}
+
+function currentAngles() {
+  const a = [0, 0, 0];
+  for (let j = 0; j < CANVAS_JOINTS; j++) {
+    a[j] = ui.dragAngles[j] !== null
+      ? ui.dragAngles[j]
+      : radFromSteps(j, state.targets[j]);
+  }
+  return a;
+}
+
+const sketch = (p) => {
+  p.setup = () => {
+    const wrap = document.getElementById("canvas-wrap");
+    const rect = wrap.getBoundingClientRect();
+    canvasSize.w = Math.max(400, Math.floor(rect.width));
+    canvasSize.h = Math.max(400, Math.floor(rect.height));
+    const c = p.createCanvas(canvasSize.w, canvasSize.h);
+    c.parent(wrap);
+    p.frameRate(60);
+  };
+  p.windowResized = () => {
+    const wrap = document.getElementById("canvas-wrap");
+    const rect = wrap.getBoundingClientRect();
+    canvasSize.w = Math.max(400, Math.floor(rect.width));
+    canvasSize.h = Math.max(400, Math.floor(rect.height));
+    p.resizeCanvas(canvasSize.w, canvasSize.h);
+  };
+  p.draw = () => {
+    p.background(24, 26, 31);
+    drawGrid(p);
+    const base = effectiveBase();
+    const len = effectiveLen();
+    const angles = currentAngles();
+    const pts = jointPositions(angles, base, len);
+    const measured = [0,1,2].map((j) => radFromSteps(j, state.positions[j]));
+    const measuredPts = jointPositions(measured, base, len);
+    drawArm(p, measuredPts, { stroke: [80,90,110], thickScale: 0.035, joints: false });
+    drawArm(p, pts, { stroke: [138,180,248], thickScale: 0.06, joints: true });
+    const hover = pickJoint(p.mouseX, p.mouseY, pts);
+    if (hover >= 0) {
+      const tip = pts[hover + 1];
+      p.noFill(); p.stroke(255,220,120,200);
+      p.strokeWeight(Math.max(1.5, len * 0.018));
+      p.circle(tip.x, tip.y, len * 0.26);
+    }
+    drawInfo(p, base, angles);
+  };
+  p.mousePressed = () => {
+    if (p.mouseButton === p.CENTER) {
+      ui.panning = true;
+      ui.panLast = { x: p.mouseX, y: p.mouseY };
+      return false;
+    }
+    const base = effectiveBase();
+    const len = effectiveLen();
+    const pts = jointPositions(currentAngles(), base, len);
+    const j = pickJoint(p.mouseX, p.mouseY, pts);
+    if (j >= 0) {
+      ui.draggingJoint = j;
+      const a = currentAngles();
+      ui.dragAngles[j] = a[j];
+    }
+  };
+  p.mouseDragged = () => {
+    if (ui.panning) {
+      ui.view.offsetX += p.mouseX - ui.panLast.x;
+      ui.view.offsetY += p.mouseY - ui.panLast.y;
+      ui.panLast = { x: p.mouseX, y: p.mouseY };
+      return;
+    }
+    const j = ui.draggingJoint;
+    if (j < 0) return;
+    const base = effectiveBase();
+    const len = effectiveLen();
+    const a = currentAngles();
+    if (ui.ikEnabled && j === CANVAS_JOINTS - 1) {
+      const tx = p.mouseX - base.x;
+      const ty = p.mouseY - base.y;
+      const sol = solveIK(a, tx, ty, len, ui.ikIters);
+      for (let k = 0; k < CANVAS_JOINTS; k++) {
+        let local = sol[k];
+        if (p.keyIsDown(p.SHIFT)) {
+          const snap = Math.PI / 12;
+          local = Math.round(local / snap) * snap;
+        }
+        ui.dragAngles[k] = local;
+        queueTarget(k, stepsFromRad(k, local));
+      }
+      return;
+    }
+    const pts = jointPositions(a, base, len);
+    const parent = pts[j];
+    let target = Math.atan2(p.mouseY - parent.y, p.mouseX - parent.x);
+    let parentAbs = 0;
+    for (let k = 0; k < j; k++) parentAbs += a[k];
+    let local = target - parentAbs;
+    local = Math.atan2(Math.sin(local), Math.cos(local));
+    if (p.keyIsDown(p.SHIFT)) {
+      const snap = Math.PI / 12;
+      local = Math.round(local / snap) * snap;
+    }
+    ui.dragAngles[j] = local;
+    queueTarget(j, stepsFromRad(j, local));
+  };
+  p.mouseReleased = () => {
+    if (ui.panning) { ui.panning = false; saveConfig(); return; }
+    const j = ui.draggingJoint;
+    if (j >= 0) {
+      const ikDrag = ui.ikEnabled && j === CANVAS_JOINTS - 1;
+      const targets = [];
+      for (let k = 0; k < CANVAS_JOINTS; k++) {
+        if (ui.dragAngles[k] === null) continue;
+        if (!ikDrag && k !== j) continue;
+        targets.push({ joint: k, position: stepsFromRad(k, ui.dragAngles[k]) });
+        ui.dragAngles[k] = null;
+      }
+      if (targets.length === 1)       postJSON("/target",  targets[0]);
+      else if (targets.length > 1)    postJSON("/targets", { targets });
+    }
+    ui.draggingJoint = -1;
+  };
+  p.mouseWheel = (e) => {
+    if (p.mouseX < 0 || p.mouseY < 0 ||
+        p.mouseX > canvasSize.w || p.mouseY > canvasSize.h) return;
+    const cx = canvasSize.w / 2 + ui.view.offsetX;
+    const cy = canvasSize.h / 2 + ui.view.offsetY;
+    const wx = (p.mouseX - cx) / ui.view.scale;
+    const wy = (p.mouseY - cy) / ui.view.scale;
+    const factor = e.delta > 0 ? 0.9 : 1.1;
+    ui.view.scale = Math.max(0.1, Math.min(10, ui.view.scale * factor));
+    ui.view.offsetX = p.mouseX - canvasSize.w / 2 - wx * ui.view.scale;
+    ui.view.offsetY = p.mouseY - canvasSize.h / 2 - wy * ui.view.scale;
+    saveConfig();
+    return false;
+  };
+
+  function pickJoint(mx, my, pts) {
+    const r = Math.max(10, effectiveLen() * 0.17);
+    let best = -1, bestD = r * r;
+    for (let j = 0; j < CANVAS_JOINTS; j++) {
+      const t = pts[j + 1];
+      const dx = mx - t.x, dy = my - t.y;
+      const d = dx * dx + dy * dy;
+      if (d < bestD) { bestD = d; best = j; }
+    }
+    return best;
+  }
+  function drawGrid(p) {
+    p.stroke(40,44,52); p.strokeWeight(1);
+    const step = Math.max(20, effectiveLen() * 0.33);
+    const base = effectiveBase();
+    const ox = ((base.x % step) + step) % step;
+    const oy = ((base.y % step) + step) % step;
+    for (let x = ox; x < canvasSize.w; x += step) p.line(x, 0, x, canvasSize.h);
+    for (let y = oy; y < canvasSize.h; y += step) p.line(0, y, canvasSize.w, y);
+    const tick = Math.max(8, effectiveLen() * 0.11);
+    p.stroke(70,80,95);
+    p.line(base.x - tick, base.y, base.x + tick, base.y);
+    p.line(base.x, base.y - tick, base.x, base.y + tick);
+  }
+  function drawArm(p, pts, opt) {
+    const len = effectiveLen();
+    p.stroke(...opt.stroke); p.strokeWeight(opt.thickScale * len); p.noFill();
+    for (let i = 0; i < pts.length - 1; i++)
+      p.line(pts[i].x, pts[i].y, pts[i+1].x, pts[i+1].y);
+    if (!opt.joints) return;
+    const baseR = Math.max(12, len * 0.20);
+    const tipR  = Math.max(10, len * 0.17);
+    p.fill(40,44,52); p.stroke(...opt.stroke);
+    p.strokeWeight(Math.max(1.5, len * 0.018));
+    p.circle(pts[0].x, pts[0].y, baseR);
+    const colors = [[138,180,248],[155,210,155],[224,200,122]];
+    for (let j = 0; j < CANVAS_JOINTS; j++) {
+      const t = pts[j+1];
+      p.fill(...colors[j]); p.stroke(20,22,26);
+      p.strokeWeight(Math.max(1.5, len * 0.018));
+      p.circle(t.x, t.y, tipR);
+      p.noStroke(); p.fill(20,22,26);
+      p.textAlign(p.CENTER, p.CENTER);
+      p.textSize(Math.max(9, len * 0.085));
+      p.text("J" + j, t.x, t.y + 1);
+    }
+  }
+  function drawInfo(p, base, angles) {
+    const fs = Math.max(11, Math.min(18, window.innerWidth * 0.0095));
+    p.noStroke(); p.fill(170);
+    p.textAlign(p.LEFT, p.TOP); p.textSize(fs);
+    const lines = [
+      `link ${ui.linkVw}vw (${Math.round(linkLenPx())}px) zoom ${ui.view.scale.toFixed(2)}x`,
+      ...angles.map((a, j) => {
+        const deg = (a * 180 / Math.PI).toFixed(1);
+        return `J${j}  ${deg.padStart(7," ")} deg  tgt ${stepsFromRad(j, a)}  pos ${state.positions[j]}`;
+      }),
+    ];
+    const pad = fs * 0.9;
+    lines.forEach((ln, i) => p.text(ln, pad, pad + i * fs * 1.35));
+  }
+};
+
+new p5(sketch);
+
+(function suppressMiddleClick() {
+  const wrap = document.getElementById("canvas-wrap");
+  wrap.addEventListener("auxclick", (e) => { if (e.button === 1) e.preventDefault(); });
+  wrap.addEventListener("mousedown", (e) => { if (e.button === 1) e.preventDefault(); });
+})();
+
+pollState();
+</script>
+</body>
+</html>

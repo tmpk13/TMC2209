@@ -1,1 +1,6 @@
 /target
+.claude
+NOTES.md
+*.uf2
+.vscode
+
