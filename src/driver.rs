@@ -20,53 +20,25 @@ use tmc2209::{data::MicroStepResolution, read_request, reg, write_request, ReadR
 
 use crate::protocol::{TMC_FLAG_INTERPOLATE, TMC_FLAG_SHAFT_INVERT, TMC_FLAG_STEALTHCHOP};
 
-/// Joint index. The TMC2209 only supports 4 addresses per shared single-wire
-/// UART bus (MS1/MS2 straps), so the firmware uses two buses: J0..=J3 live on
-/// the primary bus (UART1) with addresses 0..3, and J4 lives on the secondary
-/// bus (UART0) with address 0.
+/// Joint index → TMC2209 UART address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum JointId {
     J0 = 0,
     J1 = 1,
     J2 = 2,
-    J3 = 3,
-    J4 = 4,
-}
-
-/// Which physical TMC UART bus a joint sits on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BusId {
-    Primary,
-    Secondary,
 }
 
 impl JointId {
-    pub const ALL: [Self; 5] = [Self::J0, Self::J1, Self::J2, Self::J3, Self::J4];
-
+    pub const ALL: [Self; 3] = [Self::J0, Self::J1, Self::J2];
     pub fn addr(self) -> u8 {
-        match self {
-            // J0..J3 share the primary bus and take their natural address.
-            Self::J0 | Self::J1 | Self::J2 | Self::J3 => self as u8,
-            // J4 is alone on the secondary bus; pick address 0.
-            Self::J4 => 0,
-        }
+        self as u8
     }
-
-    pub fn bus(self) -> BusId {
-        match self {
-            Self::J0 | Self::J1 | Self::J2 | Self::J3 => BusId::Primary,
-            Self::J4 => BusId::Secondary,
-        }
-    }
-
     pub fn from_index(i: u8) -> Option<Self> {
         match i {
             0 => Some(Self::J0),
             1 => Some(Self::J1),
             2 => Some(Self::J2),
-            3 => Some(Self::J3),
-            4 => Some(Self::J4),
             _ => None,
         }
     }
@@ -261,54 +233,6 @@ impl DriverBus {
         self.write_register(joint, chop).await?;
 
         Ok(())
-    }
-}
-
-/// Two-bus aggregator. Owns the primary (J0..J3) and secondary (J4) UART
-/// `DriverBus` instances and dispatches every read/write to the right one
-/// based on `JointId::bus()`. The rest of the firmware only ever holds a
-/// `&'static Drivers` and doesn't need to know which physical UART a given
-/// joint lives on.
-pub struct Drivers {
-    primary: DriverBus,
-    secondary: DriverBus,
-}
-
-impl Drivers {
-    pub fn new(primary: DriverBus, secondary: DriverBus) -> Self {
-        Self { primary, secondary }
-    }
-
-    fn bus_for(&self, joint: JointId) -> &DriverBus {
-        match joint.bus() {
-            BusId::Primary => &self.primary,
-            BusId::Secondary => &self.secondary,
-        }
-    }
-
-    pub async fn apply_default_config(&self, joint: JointId) -> Result<(), Error> {
-        self.bus_for(joint).apply_default_config(joint).await
-    }
-
-    pub async fn apply_tmc_flags(&self, joint: JointId, flags: u8) -> Result<(), Error> {
-        self.bus_for(joint).apply_tmc_flags(joint, flags).await
-    }
-
-    pub async fn read_register_traced<R>(
-        &self,
-        joint: JointId,
-    ) -> (Result<R, Error>, [u8; DriverBus::RX_TRACE_CAP], u8)
-    where
-        R: reg::ReadableRegister,
-    {
-        self.bus_for(joint).read_register_traced::<R>(joint).await
-    }
-
-    pub async fn read_register<R>(&self, joint: JointId) -> Result<R, Error>
-    where
-        R: reg::ReadableRegister,
-    {
-        self.bus_for(joint).read_register::<R>(joint).await
     }
 }
 
