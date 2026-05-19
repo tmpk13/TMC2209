@@ -488,10 +488,10 @@ async function pollState() {
     state.port = s.port;
     state.version = s.version;
     state.ik = s.ik || { loaded: false };
-    if (s.num_joints && s.num_joints !== NUM_JOINTS) {
+    if (typeof s.num_joints === "number" && s.num_joints !== NUM_JOINTS) {
       NUM_JOINTS = s.num_joints;
     }
-    if (s.num_servos && s.num_servos !== NUM_SERVOS) {
+    if (typeof s.num_servos === "number" && s.num_servos !== NUM_SERVOS) {
       NUM_SERVOS = s.num_servos;
     }
     if (Array.isArray(s.tmc_uart_joints)) TMC_UART_JOINTS = s.tmc_uart_joints;

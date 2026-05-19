@@ -5,9 +5,17 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [features]
-default = ["rp2350"]
+default = ["rp2350", "uart"]
 rp2040 = ["embassy-rp/rp2040", "embassy-rp/boot2-w25q080"]
 rp2350 = ["embassy-rp/rp235xa"]
+# Waveshare RP2040-Zero: only GPIO 0..=15 and 26..=29 are broken out on the
+# castellated edge (GPIO16 drives the onboard WS2812). Selecting this feature
+# remaps any pin that would otherwise fall outside that range.
+rp2040-zero = ["rp2040"]
+# Drive the TMC2209s via PDN_UART. Disable to run the drivers in pin-only
+# (standalone) mode — UART hardware is not initialized and register reads
+# return Error::Uart; writes and config calls are silent no-ops.
+uart = []
 
 [dependencies]
 embassy-rp = { version = "0.10", default-features = false, features = [

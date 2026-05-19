@@ -21,7 +21,8 @@ Builds for the **Raspberry Pi Pico 2 (RP2350)** and the original **Pico
 
 ```sh
 cargo build-pico2 --release   # RP2350, default
-cargo build-pico  --release   # RP2040
+cargo build-pico  --release   # RP2040 (original Pico, 40-pin)
+cargo build-zero  --release   # RP2040-Zero (only GPIO 0..=15, 26..=29 exposed)
 ```
 
 `cargo run-*` invokes `elf2uf2-rs` to produce `firmware.uf2`. Hold BOOTSEL
@@ -58,7 +59,7 @@ cargo install elf2uf2-rs
 | GP0/1     | TMC UART0 TX/RX     | secondary bus (J4); same wiring rules as primary |
 | GP10      | EN (shared)         | active-low, starts disabled; for bringup you can tie EN to GND directly to keep all drivers permanently enabled |
 | GP14/15   | Servo0/Servo1       | PWM slice 7 A/B, 50 Hz |
-| GP25      | LED                 | |
+| GP25      | LED                 | RP2040-Zero (`--features rp2040-zero`) remaps this to GP26, since GP25 isn't broken out on that board |
 
 ## TMC2209 single-wire UART buses
 
@@ -76,9 +77,20 @@ idle-high.
     GP1 --+        +
 ```
 
-The TMC2209's MS1/MS2 straps fix the UART address at power-up
-(`MS2:MS1 = 00/01/10/11` -> address 0/1/2/3). On the primary bus J0..J3 take
-addresses 0..3; on the secondary bus J4 takes address 0 (it's alone).
+The TMC2209's MS1/MS2 straps fix the UART address at power-up. On the
+primary bus J0..J3 take addresses 0..3; on the secondary bus J4 takes
+address 0 (it's alone).
+
+| MS2 | MS1 | UART address | Primary bus | Secondary bus |
+|-----|-----|--------------|-------------|---------------|
+| GND | GND | 0            | J0          | J4            |
+| GND | VIO | 1            | J1          | -             |
+| VIO | GND | 2            | J2          | -             |
+| VIO | VIO | 3            | J3          | -             |
+
+Tie each strap directly to GND or VIO (no pull resistor needed). The same
+pins also set the microstep resolution in STEP/DIR mode, but in UART mode
+microsteps are programmed over the bus so the straps are address-only.
 
 Baud is 115200 on both buses. The firmware tolerates the echo of its own TX
 bytes transparently via `tmc2209::Reader`.

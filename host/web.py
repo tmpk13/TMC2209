@@ -27,12 +27,15 @@ from fasthtml.common import FastHTML, HTMLResponse, JSONResponse, Request
 DEFAULT_PORT = "/dev/ttyACM0"
 HTTP_HOST = "127.0.0.1"
 HTTP_PORT = 8000
-NUM_JOINTS = 5
-NUM_SERVOS = 2
+NUM_JOINTS = 3
+NUM_SERVOS = 0
 
-# Joints that have UART-controllable TMC2209 drivers. With two UART buses
-# (UART1 for J0..J3, UART0 for J4) all five joints are addressable.
-TMC_UART_JOINTS = (0, 1, 2, 3, 4)
+# Joints with UART-addressable TMC2209 drivers. Matches the firmware's
+# `JointId::ALL` (J0..J2 on the single shared UART1 bus). When the firmware
+# is built `--no-default-features` (uart off), reads will surface as
+# uart_error from the firmware - the host still asks, the answer is just
+# "no driver bus".
+TMC_UART_JOINTS = (0, 1, 2)
 
 # StateReport size: 1 tag + N_J * i32 + N_S * u16 + 1 flags.
 STATE_LEN = 1 + NUM_JOINTS * 4 + NUM_SERVOS * 2 + 1

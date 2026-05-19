@@ -33,10 +33,20 @@ rustflags = [
 # Default `cargo build` / `cargo run` targets the RP2350. The aliases below
 # pin both the target triple and the chip feature, so callers don't have to
 # remember the combo.
-build-pico2 = "build --target thumbv8m.main-none-eabihf --no-default-features --features rp2350"
-run-pico2   = "run   --target thumbv8m.main-none-eabihf --no-default-features --features rp2350"
-build-pico  = "build --target thumbv6m-none-eabi        --no-default-features --features rp2040"
-run-pico    = "run   --target thumbv6m-none-eabi        --no-default-features --features rp2040"
+build-pico2 = "build --target thumbv8m.main-none-eabihf --no-default-features --features rp2350,uart"
+run-pico2   = "run   --target thumbv8m.main-none-eabihf --no-default-features --features rp2350,uart"
+build-pico  = "build --target thumbv6m-none-eabi        --no-default-features --features rp2040,uart"
+run-pico    = "run   --target thumbv6m-none-eabi        --no-default-features --features rp2040,uart"
+build-zero  = "build --target thumbv6m-none-eabi        --no-default-features --features rp2040-zero,uart"
+run-zero    = "run   --target thumbv6m-none-eabi        --no-default-features --features rp2040-zero,uart"
+
+# Pin-only / standalone-driver variants — same chips, no PDN_UART path.
+build-pico2-nouart = "build --target thumbv8m.main-none-eabihf --no-default-features --features rp2350"
+run-pico2-nouart   = "run   --target thumbv8m.main-none-eabihf --no-default-features --features rp2350"
+build-pico-nouart  = "build --target thumbv6m-none-eabi        --no-default-features --features rp2040"
+run-pico-nouart    = "run   --target thumbv6m-none-eabi        --no-default-features --features rp2040"
+build-zero-nouart  = "build --target thumbv6m-none-eabi        --no-default-features --features rp2040-zero"
+run-zero-nouart    = "run   --target thumbv6m-none-eabi        --no-default-features --features rp2040-zero"
 
 [env]
 DEFMT_LOG = "info"

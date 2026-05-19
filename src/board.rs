@@ -28,12 +28,16 @@ pub type Dir2Pin = peripherals::PIN_7;
 // Shared driver enable (active-low).
 pub type EnablePin = peripherals::PIN_10;
 
-// Onboard LED (heartbeat).
+// Onboard LED (heartbeat). On Pico/Pico 2 this is GP25; on the RP2040-Zero
+// GP25 isn't broken out (and GP16 drives the onboard WS2812), so route the
+// heartbeat to GP26 which sits in the castellated-edge range.
+#[cfg(not(feature = "rp2040-zero"))]
 pub type LedPin = peripherals::PIN_25;
+#[cfg(feature = "rp2040-zero")]
+pub type LedPin = peripherals::PIN_26;
 
 // USB.
 pub type Usb = peripherals::USB;
 
-/// TMC2209 UART baud rate. The TMC2209 is tolerant of a wide range; 115200 is
-/// a safe, jitter-friendly choice on a 133 MHz RP2350 core.
-pub const TMC_BAUD: u32 = 115_200;
+/// TMC2209 UART baud rate. The TMC2209 is tolerant of a wide range.
+pub const TMC_BAUD: u32 = 9_600;
