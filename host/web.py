@@ -254,18 +254,22 @@ class Bridge:
 
     def jog(self, joint: int, sign: int, vmax: int) -> None:
         # Velocity-mode jog. sign in {-1, 0, +1}; vmax is steps/s magnitude.
-        # sign == 0 commands a stop at the current position; otherwise we send
-        # a far target so the firmware cruises at `vmax` until we re-command.
+        # vmax == 0 means "decelerate to a stop in place". We keep the target
+        # far in `sign` direction so it stays ahead of the real motor (the
+        # host's polled `positions` lags by one poll interval); firmware
+        # slews velocity to zero at amax and parks there. sign == 0 only
+        # happens when there is no prior direction, in which case we stop at
+        # the polled position - it might drift a few steps but won't rewind.
         if not 0 <= joint < NUM_JOINTS:
             return
         with self.lock:
             cur = int(self.positions[joint])
             self.targets[joint] = cur
             if sign == 0:
-                self._write(cmd_set_target(joint, cur, self.vmax, self.amax))
+                self._write(cmd_set_target(joint, cur, 0, self.amax))
             else:
                 far = cur + (1 if sign > 0 else -1) * 100_000_000
-                self._write(cmd_set_target(joint, far, max(1, int(vmax)), self.amax))
+                self._write(cmd_set_target(joint, far, max(0, int(vmax)), self.amax))
 
     def set_enable(self, mask: int) -> None:
         with self.lock:
@@ -459,9 +463,11 @@ class Joystick:
     _last_joint: list[int] = field(default_factory=lambda: [0] * NUM_JOINTS)
     _last_servo: list[int] = field(default_factory=lambda: [0] * NUM_SERVOS)
     _primed: bool = False
-    # Last commanded jog per (kind, idx). For joints: signed steps/s (bucketed);
-    # for servos: -1/0/+1. Used to avoid re-sending identical commands.
-    _axis_cmd: dict[tuple[str, int], int] = field(default_factory=dict)
+    # Last commanded jog per (kind, idx) as (sign, magnitude). For joints
+    # magnitude is bucketed steps/s; for servos it's 0 or 1. Tracked so we
+    # both avoid re-sending duplicate commands and remember the prior
+    # direction when the stick centers (needed to brake without rewinding).
+    _axis_cmd: dict[tuple[str, int], tuple[int, int]] = field(default_factory=dict)
 
     def snapshot(self) -> dict:
         return {
@@ -607,35 +613,41 @@ class Joystick:
         except ValueError:
             return
         key = (kind, idx)
+        prev_sign, prev_mag = self._axis_cmd.get(key, (0, 0))
         if kind == "joint" and 0 <= idx < NUM_JOINTS:
             # Bucket vmax to nearest 25 steps/s to suppress chatter when the
             # stick drifts; below 1 step/s we treat it as a stop.
             if abs(signed_velocity) < 1.0:
-                new_cmd = 0
+                new_sign, new_mag = prev_sign, 0
             else:
-                sign = 1 if signed_velocity > 0 else -1
-                mag = max(25, int(round(abs(signed_velocity) / 25.0)) * 25)
-                new_cmd = sign * mag
-            if self._axis_cmd.get(key) == new_cmd:
+                new_sign = 1 if signed_velocity > 0 else -1
+                new_mag = max(25, int(round(abs(signed_velocity) / 25.0)) * 25)
+            if (new_sign, new_mag) == (prev_sign, prev_mag):
                 return
-            self._axis_cmd[key] = new_cmd
-            if new_cmd == 0:
-                self.bridge.jog(idx, 0, 0)
-            else:
-                self.bridge.jog(idx, 1 if new_cmd > 0 else -1, abs(new_cmd))
+            self._axis_cmd[key] = (new_sign, new_mag)
+            # Skip the brake frame if we never started moving in the first place.
+            if new_mag == 0 and prev_mag == 0:
+                return
+            self.bridge.jog(idx, new_sign, new_mag)
         elif kind == "servo" and 0 <= idx < NUM_SERVOS:
-            new_cmd = 0 if abs(signed_velocity) < 1.0 else (1 if signed_velocity > 0 else -1)
-            if self._axis_cmd.get(key) == new_cmd:
+            if abs(signed_velocity) < 1.0:
+                new_sign, new_mag = prev_sign, 0
+            else:
+                new_sign = 1 if signed_velocity > 0 else -1
+                new_mag = 1
+            if (new_sign, new_mag) == (prev_sign, prev_mag):
                 return
-            self._axis_cmd[key] = new_cmd
-            self.bridge.jog_servo(idx, new_cmd)
+            self._axis_cmd[key] = (new_sign, new_mag)
+            if new_mag == 0 and prev_mag == 0:
+                return
+            self.bridge.jog_servo(idx, new_sign if new_mag else 0)
 
     def _stop_all_axes(self) -> None:
-        for (kind, idx), cmd in list(self._axis_cmd.items()):
-            if cmd == 0:
+        for (kind, idx), (sign, mag) in list(self._axis_cmd.items()):
+            if mag == 0:
                 continue
             if kind == "joint":
-                self.bridge.jog(idx, 0, 0)
+                self.bridge.jog(idx, sign, 0)
             elif kind == "servo":
                 self.bridge.jog_servo(idx, 0)
         self._axis_cmd.clear()
