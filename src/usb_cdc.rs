@@ -23,6 +23,7 @@ use crate::protocol::{
     self, encode_state, encode_tmc_config, encode_version, Command, StateReport, TmcConfigReport,
     TmcConfigStatus, VersionReport, CHIP_ID_RP2040, CHIP_ID_RP2350, RX_TRACE_LEN,
 };
+use crate::servo;
 
 /// Compile-time chip id, picked by the same `chip_*` cfg the linker uses.
 #[cfg(chip_rp2040)]
@@ -130,8 +131,25 @@ async fn read_loop(
                 let len = encode_version(&version_report(), &mut tx);
                 class.write_packet(&tx[..len]).await?;
             }
+            Ok(Command::SetServoTarget { servo, target_us }) => {
+                let _ = servo::COMMANDS
+                    .try_send(servo::ServoCommand::SetTarget { servo, target_us });
+            }
+            Ok(Command::SetServoConfig { servo, config }) => {
+                let _ = servo::COMMANDS
+                    .try_send(servo::ServoCommand::SetConfig { servo, config });
+            }
+            Ok(Command::Enable { mask }) => {
+                // The mask carries one bit per joint (J0..J4). Servos enable
+                // alongside any joint enable so their home-on-enable fires
+                // when the user clicks "enable all" in the UI.
+                let servo_mask = if mask != 0 { (1 << servo::NUM_SERVOS) - 1 } else { 0 };
+                let _ = servo::COMMANDS
+                    .try_send(servo::ServoCommand::Enable { mask: servo_mask });
+                let _ = commands.try_send(Command::Enable { mask });
+            }
             Ok(cmd) => {
-                // Non-blocking send — drop if the motion task is backed up.
+                // Non-blocking send - drop if the motion task is backed up.
                 let _ = commands.try_send(cmd);
             }
             Err(e) => defmt::warn!("bad frame: {:?}", defmt::Debug2Format(&e)),
@@ -144,7 +162,11 @@ fn current_state() -> StateReport {
     for (i, slot) in positions.iter_mut().enumerate() {
         *slot = POSITIONS[i].load(Ordering::Relaxed);
     }
-    StateReport { positions, flags: 0 }
+    StateReport {
+        positions,
+        servos: servo::snapshot(),
+        flags: 0,
+    }
 }
 
 /// Read GCONF + CHOPCONF for `joint` over the TMC2209 UART. Always

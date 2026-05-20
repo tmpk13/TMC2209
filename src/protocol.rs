@@ -5,7 +5,7 @@
 //!
 //! Commands (host → fw):
 //!   0x01  SetTarget       { joint: u8, pos: i32, vmax: u32, amax: u32 }
-//!   0x02  Enable          { mask: u8 }
+//!   0x02  Enable          { mask: u8 }   bits 0..4 = J0..J4
 //!   0x03  Home            { joint: u8 }
 //!   0x04  GetState        {} → StateReport
 //!   0x05  SetTmcConfig    { joint: u8, flags: u8 }
@@ -22,9 +22,13 @@
 //!   0x08  GetVersion      {} → Version
 //!         Returns the firmware build epoch + git short rev + chip id
 //!         so the host can confirm which binary is actually running.
+//!   0x09  SetServoTarget  { servo: u8, target_us: u16 }
+//!   0x0A  SetServoConfig  { servo: u8, min_us, max_us, deadzone_us,
+//!                            speed_us_per_s, home_us: u16, flags: u8 }
+//!         flags bit 0: home-on-enable
 //!
 //! Reports (fw → host):
-//!   0x81  StateReport     { positions: [i32; 3], flags: u8 }
+//!   0x81  StateReport     { positions: [i32; 5], servos: [u16; 2], flags: u8 }
 //!   0x82  DriverStatus    { joint: u8, drv_status: u32 }
 //!   0x83  TmcConfig       { joint: u8, status: u8, gconf: u32, chopconf: u32,
 //!                           rx_count: u8, rx_trace: [u8; 16] }   = 28 bytes
@@ -38,6 +42,7 @@
 //!         git: ASCII short rev (null-padded; "nogit" if not in a repo).
 
 use crate::motion::{JointTarget, NUM_JOINTS};
+use crate::servo::{ServoConfig, NUM_SERVOS};
 
 pub const MAX_FRAME: usize = 32;
 
@@ -51,6 +56,8 @@ pub enum Command {
     SetPosition { joint: u8, position: i32 },
     GetTmcConfig { joint: u8 },
     GetVersion,
+    SetServoTarget { servo: u8, target_us: u16 },
+    SetServoConfig { servo: u8, config: ServoConfig },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -99,9 +106,13 @@ pub const TMC_FLAG_STEALTHCHOP: u8 = 1 << 0;
 pub const TMC_FLAG_INTERPOLATE: u8 = 1 << 1;
 pub const TMC_FLAG_SHAFT_INVERT: u8 = 1 << 2;
 
+// SetServoConfig flag bits (must match host/web.py SERVO_FLAG_*).
+pub const SERVO_FLAG_HOMING: u8 = 1 << 0;
+
 #[derive(Clone, Copy, Debug)]
 pub struct StateReport {
     pub positions: [i32; NUM_JOINTS],
+    pub servos: [u16; NUM_SERVOS],
     pub flags: u8,
 }
 
@@ -159,6 +170,39 @@ pub fn decode(bytes: &[u8]) -> Result<Command, DecodeError> {
             joint: *rest.first().ok_or(DecodeError::Short)?,
         }),
         0x08 => Ok(Command::GetVersion),
+        0x09 => {
+            if rest.len() < 1 + 2 {
+                return Err(DecodeError::Short);
+            }
+            let servo = rest[0];
+            let target_us = u16::from_le_bytes(rest[1..3].try_into().unwrap());
+            Ok(Command::SetServoTarget { servo, target_us })
+        }
+        0x0A => {
+            // <BB HHHHH B> = 1 + 1 + 5*u16 + u8 = 13 bytes total; we've already
+            // peeled the tag, so `rest` is the 12 bytes after it.
+            if rest.len() < 1 + 5 * 2 + 1 {
+                return Err(DecodeError::Short);
+            }
+            let servo = rest[0];
+            let min_us = u16::from_le_bytes(rest[1..3].try_into().unwrap());
+            let max_us = u16::from_le_bytes(rest[3..5].try_into().unwrap());
+            let deadzone_us = u16::from_le_bytes(rest[5..7].try_into().unwrap());
+            let speed_us_per_s = u16::from_le_bytes(rest[7..9].try_into().unwrap());
+            let home_us = u16::from_le_bytes(rest[9..11].try_into().unwrap());
+            let flags = rest[11];
+            Ok(Command::SetServoConfig {
+                servo,
+                config: ServoConfig {
+                    min_us,
+                    max_us,
+                    deadzone_us,
+                    speed_us_per_s,
+                    home_us,
+                    flags,
+                },
+            })
+        }
         _ => Err(DecodeError::BadTag),
     }
 }
@@ -169,6 +213,10 @@ pub fn encode_state(report: &StateReport, out: &mut [u8]) -> usize {
     for p in report.positions {
         out[i..i + 4].copy_from_slice(&p.to_le_bytes());
         i += 4;
+    }
+    for s in report.servos {
+        out[i..i + 2].copy_from_slice(&s.to_le_bytes());
+        i += 2;
     }
     out[i] = report.flags;
     i + 1

@@ -12,6 +12,8 @@ an optional URDF-based IK panel that calls into host/ik.py.
 
 from __future__ import annotations
 
+import array
+import fcntl
 import os
 import struct
 import sys
@@ -27,15 +29,14 @@ from fasthtml.common import FastHTML, HTMLResponse, JSONResponse, Request
 DEFAULT_PORT = "/dev/ttyACM0"
 HTTP_HOST = "127.0.0.1"
 HTTP_PORT = 8000
-NUM_JOINTS = 3
-NUM_SERVOS = 0
+NUM_JOINTS = 5
+NUM_SERVOS = 2
 
 # Joints with UART-addressable TMC2209 drivers. Matches the firmware's
-# `JointId::ALL` (J0..J2 on the single shared UART1 bus). When the firmware
-# is built `--no-default-features` (uart off), reads will surface as
-# uart_error from the firmware - the host still asks, the answer is just
-# "no driver bus".
-TMC_UART_JOINTS = (0, 1, 2)
+# `JointId::ALL` (J0..J3 on UART1 addresses 0..=3, J4 alone on UART0).
+# With `--no-default-features` (uart off) reads will surface as uart_error
+# from the firmware - the host still asks, the answer is just "no driver bus".
+TMC_UART_JOINTS = (0, 1, 2, 3, 4)
 
 # StateReport size: 1 tag + N_J * i32 + N_S * u16 + 1 flags.
 STATE_LEN = 1 + NUM_JOINTS * 4 + NUM_SERVOS * 2 + 1
@@ -251,6 +252,21 @@ class Bridge:
             self.targets[joint] = position
             self._write(cmd_set_target(joint, position, self.vmax, self.amax))
 
+    def jog(self, joint: int, sign: int, vmax: int) -> None:
+        # Velocity-mode jog. sign in {-1, 0, +1}; vmax is steps/s magnitude.
+        # sign == 0 commands a stop at the current position; otherwise we send
+        # a far target so the firmware cruises at `vmax` until we re-command.
+        if not 0 <= joint < NUM_JOINTS:
+            return
+        with self.lock:
+            cur = int(self.positions[joint])
+            self.targets[joint] = cur
+            if sign == 0:
+                self._write(cmd_set_target(joint, cur, self.vmax, self.amax))
+            else:
+                far = cur + (1 if sign > 0 else -1) * 100_000_000
+                self._write(cmd_set_target(joint, far, max(1, int(vmax)), self.amax))
+
     def set_enable(self, mask: int) -> None:
         with self.lock:
             self.enable_mask = mask & ((1 << NUM_JOINTS) - 1)
@@ -312,6 +328,25 @@ class Bridge:
             self.servo_targets[servo] = target_us
             self._write(cmd_set_servo_target(servo, target_us))
 
+    def jog_servo(self, servo: int, sign: int) -> None:
+        # Velocity-mode jog for servos. Speed is set by ServoConfig.speed_us_per_s;
+        # we just aim at min/max us (or freeze at current us on release).
+        if not 0 <= servo < NUM_SERVOS:
+            return
+        with self.lock:
+            cfg = self.servo_configs[servo]
+            cur = int(self.servo_positions[servo])
+            cur = max(cfg.min_us, min(cfg.max_us, cur))
+            if sign == 0:
+                self.servo_targets[servo] = cur
+                self._write(cmd_set_servo_target(servo, cur))
+            elif sign > 0:
+                self.servo_targets[servo] = cfg.max_us
+                self._write(cmd_set_servo_target(servo, cfg.max_us))
+            else:
+                self.servo_targets[servo] = cfg.min_us
+                self._write(cmd_set_servo_target(servo, cfg.min_us))
+
     def set_servo_config(self, servo: int, cfg: ServoConfig) -> None:
         if not 0 <= servo < NUM_SERVOS:
             return
@@ -364,6 +399,276 @@ class Bridge:
             "tmc_uart_joints": list(TMC_UART_JOINTS),
             "version": self.version,
         }
+
+
+# == joystick (Linux /dev/input/jsN) =======================================
+
+JS_EVENT_FMT = "IhBB"
+JS_EVENT_SIZE = struct.calcsize(JS_EVENT_FMT)
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+JS_EVENT_INIT = 0x80
+JS_MAX = 32767.0
+JSIOCGAXES = 0x80016A11
+JSIOCGBUTTONS = 0x80016A12
+
+def _JSIOCGNAME(length: int) -> int:
+    return 0x80006A13 + (length << 16)
+
+
+def _js_device_info(fd: int) -> tuple[str, int, int]:
+    a = array.array("B", [0]); fcntl.ioctl(fd, JSIOCGAXES, a)
+    b = array.array("B", [0]); fcntl.ioctl(fd, JSIOCGBUTTONS, b)
+    name = array.array("B", [0] * 128); fcntl.ioctl(fd, _JSIOCGNAME(128), name)
+    return bytes(name).rstrip(b"\x00").decode(errors="replace"), a[0], b[0]
+
+
+# axis index -> (default target, default sensitivity units/sec)
+# Defaults from /home/tmpk/usb-controller-stick/README.md (Saitek Cyborg):
+#   0 L&R tilt, 1 F&B tilt, 3 pivot rotation; 4/5 top stick (0/1 hat)
+DEFAULT_AXIS_CFG: list[dict] = [
+    {"target": "joint:3", "sensitivity": 4000.0, "deadzone": 0.1, "invert": False},
+    {"target": "joint:1", "sensitivity": 4000.0, "deadzone": 0.1, "invert": False},
+    {"target": "none",    "sensitivity": 0.0,    "deadzone": 0.1, "invert": False},
+    {"target": "joint:0", "sensitivity": 4000.0, "deadzone": 0.1, "invert": False},
+    {"target": "joint:4", "sensitivity": 2000.0, "deadzone": 0.1, "invert": False},
+    {"target": "joint:2", "sensitivity": 4000.0, "deadzone": 0.1, "invert": False},
+]
+DEFAULT_BTN_CFG: list[dict] = [
+    {"target": "none", "sensitivity": 100.0} for _ in range(12)
+]
+
+
+@dataclass
+class Joystick:
+    bridge: "Bridge"
+    device: str = "/dev/input/js0"
+    enabled: bool = False
+    axes_cfg: list[dict] = field(default_factory=lambda: [dict(c) for c in DEFAULT_AXIS_CFG])
+    buttons_cfg: list[dict] = field(default_factory=lambda: [dict(c) for c in DEFAULT_BTN_CFG])
+    axis_state: list[int] = field(default_factory=lambda: [0] * 8)
+    button_state: list[int] = field(default_factory=lambda: [0] * 16)
+    device_name: str = ""
+    connected: bool = False
+    error: str = ""
+    n_axes: int = 0
+    n_buttons: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _acc_joint: list[float] = field(default_factory=lambda: [0.0] * NUM_JOINTS)
+    _acc_servo: list[float] = field(default_factory=lambda: [0.0] * NUM_SERVOS)
+    _last_joint: list[int] = field(default_factory=lambda: [0] * NUM_JOINTS)
+    _last_servo: list[int] = field(default_factory=lambda: [0] * NUM_SERVOS)
+    _primed: bool = False
+    # Last commanded jog per (kind, idx). For joints: signed steps/s (bucketed);
+    # for servos: -1/0/+1. Used to avoid re-sending identical commands.
+    _axis_cmd: dict[tuple[str, int], int] = field(default_factory=dict)
+
+    def snapshot(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "device": self.device,
+            "device_name": self.device_name,
+            "connected": self.connected,
+            "error": self.error,
+            "n_axes": self.n_axes,
+            "n_buttons": self.n_buttons,
+            "axis_state": list(self.axis_state),
+            "button_state": list(self.button_state),
+            "axes_cfg": [dict(c) for c in self.axes_cfg],
+            "buttons_cfg": [dict(c) for c in self.buttons_cfg],
+        }
+
+    def configure(self, data: dict) -> None:
+        with self._lock:
+            if "device" in data and isinstance(data["device"], str):
+                new_dev = data["device"].strip()
+                if new_dev and new_dev != self.device:
+                    self.device = new_dev
+                    self.connected = False  # reader_loop will reopen
+            if "enabled" in data:
+                self.enabled = bool(data["enabled"])
+                if self.enabled:
+                    self._primed = False  # re-prime accumulator on enable
+            if isinstance(data.get("axes_cfg"), list):
+                for i, c in enumerate(data["axes_cfg"]):
+                    if i >= len(self.axes_cfg):
+                        self.axes_cfg.append({})
+                    self.axes_cfg[i].update({
+                        "target":      str(c.get("target", "none")),
+                        "sensitivity": float(c.get("sensitivity", 0.0)),
+                        "deadzone":    max(0.0, min(0.95, float(c.get("deadzone", 0.0)))),
+                        "invert":      bool(c.get("invert", False)),
+                    })
+            if isinstance(data.get("buttons_cfg"), list):
+                for i, c in enumerate(data["buttons_cfg"]):
+                    if i >= len(self.buttons_cfg):
+                        self.buttons_cfg.append({})
+                    self.buttons_cfg[i].update({
+                        "target":      str(c.get("target", "none")),
+                        "sensitivity": float(c.get("sensitivity", 0.0)),
+                    })
+
+    def _prime_locked(self) -> None:
+        with self.bridge.lock:
+            self._acc_joint = [float(t) for t in self.bridge.targets]
+            self._acc_servo = [float(t) for t in self.bridge.servo_targets]
+        self._last_joint = [int(round(v)) for v in self._acc_joint]
+        self._last_servo = [int(round(v)) for v in self._acc_servo]
+        self._primed = True
+
+    def _apply_delta(self, target: str, delta: float) -> None:
+        kind, _, idx_s = target.partition(":")
+        try:
+            idx = int(idx_s)
+        except ValueError:
+            return
+        if kind == "joint" and 0 <= idx < NUM_JOINTS:
+            self._acc_joint[idx] += delta
+            new_v = int(round(self._acc_joint[idx]))
+            if new_v != self._last_joint[idx]:
+                self._last_joint[idx] = new_v
+                self.bridge.set_target(idx, new_v)
+        elif kind == "servo" and 0 <= idx < NUM_SERVOS:
+            self._acc_servo[idx] += delta
+            new_v = int(round(self._acc_servo[idx]))
+            if new_v != self._last_servo[idx]:
+                self._last_servo[idx] = new_v
+                self.bridge.set_servo_target(idx, new_v)
+
+    def _on_button_press(self, idx: int) -> None:
+        if idx >= len(self.buttons_cfg):
+            return
+        cfg = self.buttons_cfg[idx]
+        target = cfg.get("target", "none")
+        if target == "none":
+            return
+        if not self._primed:
+            self._prime_locked()
+        self._apply_delta(target, float(cfg.get("sensitivity", 0.0)))
+
+    def reader_loop(self) -> None:
+        fd = -1
+        while True:
+            if not self.enabled:
+                if fd >= 0:
+                    try: os.close(fd)
+                    except OSError: pass
+                    fd = -1
+                self.connected = False
+                time.sleep(0.2)
+                continue
+            if fd < 0:
+                try:
+                    fd = os.open(self.device, os.O_RDONLY | os.O_NONBLOCK)
+                    name, n_axes, n_btns = _js_device_info(fd)
+                    self.device_name = name
+                    self.n_axes = n_axes
+                    self.n_buttons = n_btns
+                    self.axis_state = [0] * max(n_axes, 8)
+                    self.button_state = [0] * max(n_btns, 16)
+                    self.connected = True
+                    self.error = ""
+                except OSError as e:
+                    self.error = str(e)
+                    self.connected = False
+                    time.sleep(1.0)
+                    continue
+            try:
+                data = os.read(fd, JS_EVENT_SIZE)
+            except BlockingIOError:
+                time.sleep(0.005)
+                continue
+            except OSError as e:
+                self.error = str(e)
+                try: os.close(fd)
+                except OSError: pass
+                fd = -1
+                self.connected = False
+                time.sleep(0.5)
+                continue
+            if not data or len(data) < JS_EVENT_SIZE:
+                time.sleep(0.005)
+                continue
+            _, value, ev_type, number = struct.unpack(JS_EVENT_FMT, data)
+            is_init = bool(ev_type & JS_EVENT_INIT)
+            ev_type &= ~JS_EVENT_INIT
+            if ev_type == JS_EVENT_AXIS and number < len(self.axis_state):
+                self.axis_state[number] = value
+            elif ev_type == JS_EVENT_BUTTON and number < len(self.button_state):
+                prev = self.button_state[number]
+                self.button_state[number] = value
+                if value and not prev and not is_init:
+                    self._on_button_press(number)
+
+    def _apply_axis_velocity(self, target: str, signed_velocity: float) -> None:
+        kind, _, idx_s = target.partition(":")
+        try:
+            idx = int(idx_s)
+        except ValueError:
+            return
+        key = (kind, idx)
+        if kind == "joint" and 0 <= idx < NUM_JOINTS:
+            # Bucket vmax to nearest 25 steps/s to suppress chatter when the
+            # stick drifts; below 1 step/s we treat it as a stop.
+            if abs(signed_velocity) < 1.0:
+                new_cmd = 0
+            else:
+                sign = 1 if signed_velocity > 0 else -1
+                mag = max(25, int(round(abs(signed_velocity) / 25.0)) * 25)
+                new_cmd = sign * mag
+            if self._axis_cmd.get(key) == new_cmd:
+                return
+            self._axis_cmd[key] = new_cmd
+            if new_cmd == 0:
+                self.bridge.jog(idx, 0, 0)
+            else:
+                self.bridge.jog(idx, 1 if new_cmd > 0 else -1, abs(new_cmd))
+        elif kind == "servo" and 0 <= idx < NUM_SERVOS:
+            new_cmd = 0 if abs(signed_velocity) < 1.0 else (1 if signed_velocity > 0 else -1)
+            if self._axis_cmd.get(key) == new_cmd:
+                return
+            self._axis_cmd[key] = new_cmd
+            self.bridge.jog_servo(idx, new_cmd)
+
+    def _stop_all_axes(self) -> None:
+        for (kind, idx), cmd in list(self._axis_cmd.items()):
+            if cmd == 0:
+                continue
+            if kind == "joint":
+                self.bridge.jog(idx, 0, 0)
+            elif kind == "servo":
+                self.bridge.jog_servo(idx, 0)
+        self._axis_cmd.clear()
+
+    def integrate_loop(self) -> None:
+        was_active = False
+        while True:
+            time.sleep(0.025)
+            active = self.enabled and self.connected
+            if not active:
+                if was_active:
+                    self._stop_all_axes()
+                self._primed = False
+                was_active = False
+                continue
+            was_active = True
+            for i, cfg in enumerate(self.axes_cfg):
+                if i >= len(self.axis_state):
+                    continue
+                target = cfg.get("target", "none")
+                if target == "none":
+                    continue
+                raw = self.axis_state[i] / JS_MAX
+                if cfg.get("invert"):
+                    raw = -raw
+                dz = float(cfg.get("deadzone", 0.0))
+                ar = abs(raw)
+                if ar < dz:
+                    signed_v = 0.0
+                else:
+                    norm = ((ar - dz) / (1.0 - dz)) * (1.0 if raw > 0 else -1.0)
+                    signed_v = norm * float(cfg.get("sensitivity", 0.0))
+                self._apply_axis_velocity(target, signed_v)
 
 
 # == optional IK (lazy) ====================================================
@@ -421,7 +726,7 @@ class IKAdapter:
 
 # == fasthtml app ==========================================================
 
-def build_app(bridge: Bridge) -> FastHTML:
+def build_app(bridge: Bridge, joystick: "Joystick") -> FastHTML:
     app = FastHTML()
     ik = IKAdapter()
 
@@ -511,6 +816,16 @@ def build_app(bridge: Bridge) -> FastHTML:
             "error": bridge.error,
         })
 
+    @app.get("/joystick")
+    def get_joystick():
+        return JSONResponse(joystick.snapshot())
+
+    @app.post("/joystick/config")
+    async def post_joystick_config(req: Request):
+        data = await req.json()
+        joystick.configure(data)
+        return JSONResponse({"ok": True, "state": joystick.snapshot()})
+
     @app.post("/ik/load")
     async def post_ik_load(req: Request):
         try:
@@ -538,7 +853,11 @@ def main() -> None:
     bridge.open()
     threading.Thread(target=bridge.poll_loop, daemon=True).start()
 
-    app = build_app(bridge)
+    joystick = Joystick(bridge=bridge)
+    threading.Thread(target=joystick.reader_loop, daemon=True).start()
+    threading.Thread(target=joystick.integrate_loop, daemon=True).start()
+
+    app = build_app(bridge, joystick)
     print(f"serving http://{HTTP_HOST}:{HTTP_PORT}  (serial {port_name})")
     try:
         uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT, log_level="warning")

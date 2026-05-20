@@ -162,3 +162,5 @@ TUI pushes `SetServoConfig` on every connect.
 
 Non-obvious choices, gotchas, and the rationale behind the protocol/pinout
 live in [NOTES.md](NOTES.md).
+
+

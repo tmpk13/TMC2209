@@ -1,34 +1,40 @@
-//! Hobby-servo control via the RP2040/RP2350 PWM peripheral.
+//! Hobby-servo PWM output with software slew limiting and home-on-enable.
 //!
-//! Two servos share PWM slice 7 (channels A and B), so they run off the same
-//! 50 Hz / 20 ms period clock; only the compare value differs between them.
-//! The divider is set so one PWM count equals one microsecond, which means the
-//! compare register reads directly in microseconds of pulse width.
+//! Two servos share PWM slice 7 (channel A on GP14, channel B on GP15) so they
+//! run off the same wrap counter at 50 Hz. The slice is clocked at 1 MHz
+//! (sysclk / 125) so the compare register reads directly in microseconds:
+//! TOP = 19_999 gives a 20 ms period and `compare_x = target_us` produces the
+//! corresponding pulse width.
 //!
-//! Each servo carries its own [`ServoConfig`]:
-//!   - `min_us` / `max_us`     pulse-width clamp (e.g. 500..2500)
-//!   - `deadzone_us`           moves smaller than this are ignored
-//!   - `speed_us_per_s`        slew rate; 0 means "snap to target"
-//!   - `flags` bit 0           homing on enable
-//!   - `home_us`               home pulse used when homing is enabled
-//!
-//! The controller is ticked from the motion task. On each tick it slews the
-//! commanded pulse width toward the target while respecting the deadzone.
+//! The servo task runs at 50 Hz and slews the live pulse width toward the
+//! commanded target at `speed_us_per_s`. When a servo is enabled (via the
+//! joint enable mask) and `SERVO_FLAG_HOMING` is set, the target snaps to
+//! `home_us` on the disabled->enabled transition. `POSITIONS` carries the
+//! live pulse width so the host UI can show it.
 
 use core::sync::atomic::{AtomicU16, Ordering};
 
+use embassy_executor::Spawner;
 use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 use embassy_rp::Peri;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::{Channel, Receiver};
+use embassy_time::{Duration, Ticker};
 use fixed::traits::ToFixed;
 
 use crate::board;
-use crate::motion::NUM_SERVOS;
+use crate::protocol::SERVO_FLAG_HOMING;
 
-/// Latest commanded pulse width per servo, in microseconds. Updated by the
-/// motion task; read by the USB task to serve `GetState`.
-pub static SERVO_POSITIONS: [AtomicU16; NUM_SERVOS] = [AtomicU16::new(0), AtomicU16::new(0)];
+pub const NUM_SERVOS: usize = 2;
+const TICK_HZ: u32 = 50;
+const PWM_TOP: u16 = 19_999;
 
-pub const SERVO_FLAG_HOMING: u8 = 1 << 0;
+#[derive(Clone, Copy, Debug)]
+pub enum ServoCommand {
+    SetTarget { servo: u8, target_us: u16 },
+    SetConfig { servo: u8, config: ServoConfig },
+    Enable { mask: u8 },
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ServoConfig {
@@ -40,8 +46,8 @@ pub struct ServoConfig {
     pub flags: u8,
 }
 
-impl Default for ServoConfig {
-    fn default() -> Self {
+impl ServoConfig {
+    pub const fn boot_default() -> Self {
         Self {
             min_us: 500,
             max_us: 2_500,
@@ -53,139 +59,146 @@ impl Default for ServoConfig {
     }
 }
 
-impl ServoConfig {
-    pub fn homing_enabled(self) -> bool {
-        self.flags & SERVO_FLAG_HOMING != 0
-    }
+/// Live pulse widths in microseconds, readable from any task without locking.
+pub static POSITIONS: [AtomicU16; NUM_SERVOS] =
+    [AtomicU16::new(1500), AtomicU16::new(1500)];
+
+pub static COMMANDS: Channel<CriticalSectionRawMutex, ServoCommand, 8> = Channel::new();
+
+pub fn snapshot() -> [u16; NUM_SERVOS] {
+    [
+        POSITIONS[0].load(Ordering::Relaxed),
+        POSITIONS[1].load(Ordering::Relaxed),
+    ]
 }
 
-struct ServoState {
+struct Servo {
     config: ServoConfig,
-    /// Latest target pulse width in microseconds (clamped to config).
-    target_us: f32,
-    /// Currently commanded pulse width (slews toward target).
+    target_us: u16,
     current_us: f32,
+    enabled: bool,
 }
 
-impl ServoState {
-    fn new(config: ServoConfig) -> Self {
-        let home = config.home_us as f32;
+impl Servo {
+    const fn new() -> Self {
+        let cfg = ServoConfig::boot_default();
         Self {
-            config,
-            target_us: home,
-            current_us: home,
+            config: cfg,
+            target_us: cfg.home_us,
+            current_us: cfg.home_us as f32,
+            enabled: false,
         }
     }
 
-    fn clamp(&self, v: f32) -> f32 {
-        v.clamp(self.config.min_us as f32, self.config.max_us as f32)
+    fn clamp(&self, us: u16) -> u16 {
+        us.clamp(self.config.min_us, self.config.max_us)
     }
 
     fn set_target(&mut self, target_us: u16) {
-        self.target_us = self.clamp(target_us as f32);
+        self.target_us = self.clamp(target_us);
     }
 
-    fn set_config(&mut self, config: ServoConfig) {
-        self.config = config;
+    fn set_config(&mut self, cfg: ServoConfig) {
+        self.config = cfg;
+        // Keep the existing target inside the new range.
         self.target_us = self.clamp(self.target_us);
-        self.current_us = self.clamp(self.current_us);
     }
 
-    /// Advance toward the target by one tick. Returns the new compare value
-    /// (in microseconds), or `None` if no change was needed.
-    fn step(&mut self, dt_us: u32) -> Option<u16> {
-        let cfg = self.config;
-        let err = self.target_us - self.current_us;
-        if libm::fabsf(err) <= cfg.deadzone_us as f32 {
-            return None;
+    fn on_enable(&mut self, on: bool) {
+        if on && !self.enabled && self.config.flags & SERVO_FLAG_HOMING != 0 {
+            self.target_us = self.clamp(self.config.home_us);
         }
-        if cfg.speed_us_per_s == 0 {
-            self.current_us = self.target_us;
-            return Some(self.current_us as u16);
-        }
-        let dt_s = dt_us as f32 * 1e-6;
-        let max_step = cfg.speed_us_per_s as f32 * dt_s;
-        let step = err.clamp(-max_step, max_step);
-        self.current_us = self.clamp(self.current_us + step);
-        Some(self.current_us as u16)
-    }
-}
-
-pub struct ServoController<'d> {
-    pwm: Pwm<'d>,
-    servos: [ServoState; NUM_SERVOS],
-}
-
-impl<'d> ServoController<'d> {
-    pub fn new(
-        slice: Peri<'d, board::ServoPwm>,
-        pin_a: Peri<'d, board::Servo0Pin>,
-        pin_b: Peri<'d, board::Servo1Pin>,
-    ) -> Self {
-        let mut cfg = PwmConfig::default();
-        cfg.divider = (board::SERVO_DIV as u16).to_fixed();
-        cfg.top = board::SERVO_TOP;
-        let servo_a = ServoState::new(ServoConfig::default());
-        let servo_b = ServoState::new(ServoConfig::default());
-        cfg.compare_a = servo_a.current_us as u16;
-        cfg.compare_b = servo_b.current_us as u16;
-        cfg.enable = true;
-        let pwm = Pwm::new_output_ab(slice, pin_a, pin_b, cfg);
-        Self {
-            pwm,
-            servos: [servo_a, servo_b],
-        }
+        self.enabled = on;
     }
 
-    pub fn set_target(&mut self, id: u8, target_us: u16) {
-        if let Some(s) = self.servos.get_mut(id as usize) {
-            s.set_target(target_us);
+    /// Advance current_us toward target_us at speed_us_per_s.
+    fn tick(&mut self, dt: f32) -> u16 {
+        if !self.enabled {
+            return self.current_us as u16;
+        }
+        let err = self.target_us as f32 - self.current_us;
+        if libm::fabsf(err) <= self.config.deadzone_us as f32 {
+            self.current_us = self.target_us as f32;
         } else {
-            defmt::warn!("servo set target: bad id {}", id);
+            let step = self.config.speed_us_per_s as f32 * dt;
+            let delta = if err.abs() <= step {
+                err
+            } else {
+                step.copysign(err)
+            };
+            self.current_us += delta;
         }
+        self.current_us as u16
     }
+}
 
-    pub fn set_config(&mut self, id: u8, config: ServoConfig) {
-        if let Some(s) = self.servos.get_mut(id as usize) {
-            s.set_config(config);
-            if config.homing_enabled() {
-                s.target_us = s.clamp(config.home_us as f32);
+#[embassy_executor::task]
+async fn servo_task(
+    mut pwm: Pwm<'static>,
+    mut cfg: PwmConfig,
+    commands: Receiver<'static, CriticalSectionRawMutex, ServoCommand, 8>,
+) {
+    let mut servos = [Servo::new(), Servo::new()];
+    let period = Duration::from_hz(TICK_HZ as u64);
+    let mut ticker = Ticker::every(period);
+    let dt = 1.0 / TICK_HZ as f32;
+
+    cfg.compare_a = servos[0].current_us as u16;
+    cfg.compare_b = servos[1].current_us as u16;
+    pwm.set_config(&cfg);
+
+    loop {
+        while let Ok(cmd) = commands.try_receive() {
+            match cmd {
+                ServoCommand::SetTarget { servo, target_us } => {
+                    if let Some(s) = servos.get_mut(servo as usize) {
+                        s.set_target(target_us);
+                    } else {
+                        defmt::warn!("servo target: bad index {}", servo);
+                    }
+                }
+                ServoCommand::SetConfig { servo, config } => {
+                    if let Some(s) = servos.get_mut(servo as usize) {
+                        s.set_config(config);
+                    } else {
+                        defmt::warn!("servo config: bad index {}", servo);
+                    }
+                }
+                ServoCommand::Enable { mask } => {
+                    for (i, s) in servos.iter_mut().enumerate() {
+                        s.on_enable(mask & (1 << i) != 0);
+                    }
+                }
             }
-        } else {
-            defmt::warn!("servo set config: bad id {}", id);
         }
-    }
 
-    pub fn config(&self, id: u8) -> Option<ServoConfig> {
-        self.servos.get(id as usize).map(|s| s.config)
-    }
+        let us0 = servos[0].tick(dt);
+        let us1 = servos[1].tick(dt);
+        POSITIONS[0].store(us0, Ordering::Relaxed);
+        POSITIONS[1].store(us1, Ordering::Relaxed);
 
-    pub fn report_positions(&self) -> [u16; NUM_SERVOS] {
-        [
-            SERVO_POSITIONS[0].load(Ordering::Relaxed),
-            SERVO_POSITIONS[1].load(Ordering::Relaxed),
-        ]
-    }
+        cfg.compare_a = us0;
+        cfg.compare_b = us1;
+        pwm.set_config(&cfg);
 
-    pub fn tick(&mut self, dt_us: u32) {
-        // We have to read out the current config, modify the compare fields,
-        // and write the whole thing back - the embassy-rp PWM API doesn't
-        // expose a per-channel compare setter.
-        let a_new = self.servos[0].step(dt_us);
-        let b_new = self.servos[1].step(dt_us);
-        if a_new.is_none() && b_new.is_none() {
-            return;
-        }
-        let a_cmp = a_new.unwrap_or(self.servos[0].current_us as u16);
-        let b_cmp = b_new.unwrap_or(self.servos[1].current_us as u16);
-        SERVO_POSITIONS[0].store(a_cmp, Ordering::Relaxed);
-        SERVO_POSITIONS[1].store(b_cmp, Ordering::Relaxed);
-        let mut cfg = PwmConfig::default();
-        cfg.divider = (board::SERVO_DIV as u16).to_fixed();
-        cfg.top = board::SERVO_TOP;
-        cfg.compare_a = a_cmp;
-        cfg.compare_b = b_cmp;
-        cfg.enable = true;
-        self.pwm.set_config(&cfg);
+        ticker.next().await;
     }
+}
+
+pub fn spawn(
+    spawner: Spawner,
+    slice: Peri<'static, board::ServoSlice>,
+    pin_a: Peri<'static, board::Servo0Pin>,
+    pin_b: Peri<'static, board::Servo1Pin>,
+) {
+    // 1 MHz PWM clock so compare counts read as microseconds. TOP = 19_999
+    // gives a 20 ms (50 Hz) period.
+    let mut cfg = PwmConfig::default();
+    cfg.divider = 125u8.to_fixed();
+    cfg.top = PWM_TOP;
+    cfg.compare_a = 1500;
+    cfg.compare_b = 1500;
+    cfg.enable = true;
+    let pwm = Pwm::new_output_ab(slice, pin_a, pin_b, cfg.clone());
+    spawner.must_spawn(servo_task(pwm, cfg, COMMANDS.receiver()));
 }

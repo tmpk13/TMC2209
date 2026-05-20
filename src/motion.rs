@@ -25,9 +25,10 @@
 use core::sync::atomic::{AtomicI32, Ordering};
 
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::PIO0;
+use embassy_rp::peripherals::{PIO0, PIO1};
 use embassy_rp::pio::{
-    Common, Config as PioConfig, Direction, LoadedProgram, Pio, ShiftDirection, StateMachine,
+    Common, Config as PioConfig, Direction, Instance as PioInstance, LoadedProgram, Pio,
+    ShiftDirection, StateMachine,
 };
 use embassy_rp::pio_programs::clock_divider::calculate_pio_clock_divider;
 use embassy_rp::Peri;
@@ -37,9 +38,10 @@ use embassy_time::{Duration, Ticker};
 use fixed::traits::ToFixed;
 
 use crate::board;
+use crate::servo;
 use crate::protocol::{Command, StateReport};
 
-pub const NUM_JOINTS: usize = 3;
+pub const NUM_JOINTS: usize = 5;
 const TICK_HZ: u32 = 200;
 /// PIO cycles per step pulse: jmp(1) + nop_high(1+7) + nop_low(1+7) + jmp_dec(1) = 18.
 const PIO_CYCLES_PER_STEP: u32 = 18;
@@ -67,24 +69,29 @@ impl Default for JointTarget {
 pub type CommandReceiver = Receiver<'static, CriticalSectionRawMutex, Command, 8>;
 
 /// Feedback positions, readable from any task without locking.
-pub static POSITIONS: [AtomicI32; NUM_JOINTS] =
-    [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)];
+pub static POSITIONS: [AtomicI32; NUM_JOINTS] = [
+    AtomicI32::new(0),
+    AtomicI32::new(0),
+    AtomicI32::new(0),
+    AtomicI32::new(0),
+    AtomicI32::new(0),
+];
 
-struct Joint<'d, const SM: usize> {
-    sm: StateMachine<'d, PIO0, SM>,
+struct Joint<'d, P: PioInstance, const SM: usize> {
+    sm: StateMachine<'d, P, SM>,
     dir: Output<'d>,
     /// Committed position in microsteps (total steps emitted so far).
     position: i32,
     /// Current velocity in microsteps/second, signed.
     velocity: f32,
-    /// Fractional-microstep accumulator — carries the sub-step remainder
+    /// Fractional-microstep accumulator - carries the sub-step remainder
     /// between ticks so slow moves still make progress.
     frac_accum: f32,
     target: JointTarget,
     enabled: bool,
 }
 
-impl<'d, const SM: usize> Joint<'d, SM> {
+impl<'d, P: PioInstance, const SM: usize> Joint<'d, P, SM> {
     /// Adopt `position` as the joint's current microstep count without
     /// commanding any motion. Snaps target to match and clears the motion
     /// integrators so the next tick starts from rest at the new origin.
@@ -155,30 +162,44 @@ impl<'d, const SM: usize> Joint<'d, SM> {
 }
 
 pub struct MotionController<'d> {
-    j0: Joint<'d, 0>,
-    j1: Joint<'d, 1>,
-    j2: Joint<'d, 2>,
+    j0: Joint<'d, PIO0, 0>,
+    j1: Joint<'d, PIO0, 1>,
+    j2: Joint<'d, PIO0, 2>,
+    j3: Joint<'d, PIO0, 3>,
+    j4: Joint<'d, PIO1, 0>,
     enable: Output<'d>,
 }
 
 impl<'d> MotionController<'d> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        pio: Pio<'d, PIO0>,
+        pio0: Pio<'d, PIO0>,
+        pio1: Pio<'d, PIO1>,
         step0: Peri<'d, board::Step0Pin>,
         step1: Peri<'d, board::Step1Pin>,
         step2: Peri<'d, board::Step2Pin>,
+        step3: Peri<'d, board::Step3Pin>,
+        step4: Peri<'d, board::Step4Pin>,
         dir0: Peri<'d, board::Dir0Pin>,
         dir1: Peri<'d, board::Dir1Pin>,
         dir2: Peri<'d, board::Dir2Pin>,
+        dir3: Peri<'d, board::Dir3Pin>,
+        dir4: Peri<'d, board::Dir4Pin>,
         enable: Peri<'d, board::EnablePin>,
     ) -> Self {
         let Pio {
-            mut common,
+            common: mut common0,
             sm0,
             sm1,
             sm2,
+            sm3,
             ..
-        } = pio;
+        } = pio0;
+        let Pio {
+            common: mut common1,
+            sm0: sm1_0,
+            ..
+        } = pio1;
 
         let prg = pio::pio_asm!(
             ".side_set 1",
@@ -191,41 +212,23 @@ impl<'d> MotionController<'d> {
             "    nop               side 0 [7]",
             "    jmp x-- loop_     side 0",
         );
-        let loaded = common.load_program(&prg.program);
+        // Each PIO has its own instruction memory, so load the program twice.
+        let loaded0 = common0.load_program(&prg.program);
+        let loaded1 = common1.load_program(&prg.program);
 
-        let j0 = setup_sm(&mut common, sm0, &loaded, step0);
-        let j1 = setup_sm(&mut common, sm1, &loaded, step1);
-        let j2 = setup_sm(&mut common, sm2, &loaded, step2);
+        let j0_sm = setup_sm(&mut common0, sm0, &loaded0, step0);
+        let j1_sm = setup_sm(&mut common0, sm1, &loaded0, step1);
+        let j2_sm = setup_sm(&mut common0, sm2, &loaded0, step2);
+        let j3_sm = setup_sm(&mut common0, sm3, &loaded0, step3);
+        let j4_sm = setup_sm(&mut common1, sm1_0, &loaded1, step4);
 
         Self {
-            j0: Joint {
-                sm: j0,
-                dir: Output::new(dir0, Level::Low),
-                position: 0,
-                velocity: 0.0,
-                frac_accum: 0.0,
-                target: JointTarget::default(),
-                enabled: true,
-            },
-            j1: Joint {
-                sm: j1,
-                dir: Output::new(dir1, Level::Low),
-                position: 0,
-                velocity: 0.0,
-                frac_accum: 0.0,
-                target: JointTarget::default(),
-                enabled: true,
-            },
-            j2: Joint {
-                sm: j2,
-                dir: Output::new(dir2, Level::Low),
-                position: 0,
-                velocity: 0.0,
-                frac_accum: 0.0,
-                target: JointTarget::default(),
-                enabled: true,
-            },
-            enable: Output::new(enable, Level::High), // active-low → disabled on boot
+            j0: Joint::new(j0_sm, Output::new(dir0, Level::Low)),
+            j1: Joint::new(j1_sm, Output::new(dir1, Level::Low)),
+            j2: Joint::new(j2_sm, Output::new(dir2, Level::Low)),
+            j3: Joint::new(j3_sm, Output::new(dir3, Level::Low)),
+            j4: Joint::new(j4_sm, Output::new(dir4, Level::Low)),
+            enable: Output::new(enable, Level::High), // active-low -> disabled on boot
         }
     }
 
@@ -235,7 +238,14 @@ impl<'d> MotionController<'d> {
 
     pub fn state(&self) -> StateReport {
         StateReport {
-            positions: [self.j0.position, self.j1.position, self.j2.position],
+            positions: [
+                self.j0.position,
+                self.j1.position,
+                self.j2.position,
+                self.j3.position,
+                self.j4.position,
+            ],
+            servos: servo::snapshot(),
             flags: 0,
         }
     }
@@ -246,28 +256,37 @@ impl<'d> MotionController<'d> {
                 0 => self.j0.target = target,
                 1 => self.j1.target = target,
                 2 => self.j2.target = target,
+                3 => self.j3.target = target,
+                4 => self.j4.target = target,
                 _ => defmt::warn!("unknown joint id {}", joint),
             },
             Command::Enable { mask } => {
                 let any = mask != 0;
                 self.set_enable(any);
-                self.j0.enabled = mask & 0b001 != 0;
-                self.j1.enabled = mask & 0b010 != 0;
-                self.j2.enabled = mask & 0b100 != 0;
+                self.j0.enabled = mask & 0b00001 != 0;
+                self.j1.enabled = mask & 0b00010 != 0;
+                self.j2.enabled = mask & 0b00100 != 0;
+                self.j3.enabled = mask & 0b01000 != 0;
+                self.j4.enabled = mask & 0b10000 != 0;
             }
             Command::SetPosition { joint, position } => match joint {
                 0 => self.j0.set_position(0, position),
                 1 => self.j1.set_position(1, position),
                 2 => self.j2.set_position(2, position),
+                3 => self.j3.set_position(3, position),
+                4 => self.j4.set_position(4, position),
                 _ => defmt::warn!("set position: bad joint {}", joint),
             },
             // SetTmcConfig and GetTmcConfig are handled in the USB task
-            // (it owns the driver bus).
+            // (it owns the driver bus). Servo commands route through their
+            // own channel into the servo task.
             Command::Home { .. }
             | Command::GetState
             | Command::SetTmcConfig { .. }
             | Command::GetTmcConfig { .. }
-            | Command::GetVersion => {}
+            | Command::GetVersion
+            | Command::SetServoTarget { .. }
+            | Command::SetServoConfig { .. } => {}
         }
     }
 
@@ -282,17 +301,33 @@ impl<'d> MotionController<'d> {
             self.j0.tick(0, dt_us);
             self.j1.tick(1, dt_us);
             self.j2.tick(2, dt_us);
+            self.j3.tick(3, dt_us);
+            self.j4.tick(4, dt_us);
             ticker.next().await;
         }
     }
 }
 
-fn setup_sm<'d, const SM: usize>(
-    common: &mut Common<'d, PIO0>,
-    mut sm: StateMachine<'d, PIO0, SM>,
-    program: &LoadedProgram<'d, PIO0>,
+impl<'d, P: PioInstance, const SM: usize> Joint<'d, P, SM> {
+    fn new(sm: StateMachine<'d, P, SM>, dir: Output<'d>) -> Self {
+        Self {
+            sm,
+            dir,
+            position: 0,
+            velocity: 0.0,
+            frac_accum: 0.0,
+            target: JointTarget::default(),
+            enabled: true,
+        }
+    }
+}
+
+fn setup_sm<'d, P: PioInstance, const SM: usize>(
+    common: &mut Common<'d, P>,
+    mut sm: StateMachine<'d, P, SM>,
+    program: &LoadedProgram<'d, P>,
     step_pin: Peri<'d, impl embassy_rp::pio::PioPin>,
-) -> StateMachine<'d, PIO0, SM> {
+) -> StateMachine<'d, P, SM> {
     let pin = common.make_pio_pin(step_pin);
     sm.set_pin_dirs(Direction::Out, &[&pin]);
 

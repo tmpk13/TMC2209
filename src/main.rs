@@ -7,8 +7,8 @@ use panic_probe as _;
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 #[cfg(feature = "uart")]
-use embassy_rp::peripherals::UART1;
-use embassy_rp::peripherals::{PIO0, USB};
+use embassy_rp::peripherals::{UART0, UART1};
+use embassy_rp::peripherals::{PIO0, PIO1, USB};
 use embassy_rp::pio::{InterruptHandler as PioIrq, Pio};
 #[cfg(feature = "uart")]
 use embassy_rp::uart::{BufferedInterruptHandler as UartIrq, BufferedUart, Config as UartConfig};
@@ -22,6 +22,7 @@ mod board;
 mod driver;
 mod motion;
 mod protocol;
+mod servo;
 mod usb_cdc;
 
 use crate::driver::DriverBus;
@@ -41,6 +42,8 @@ pub static IMAGE_DEF: embassy_rp::block::ImageDef = embassy_rp::block::ImageDef:
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbIrq<USB>;
     PIO0_IRQ_0 => PioIrq<PIO0>;
+    PIO1_IRQ_0 => PioIrq<PIO1>;
+    UART0_IRQ => UartIrq<UART0>;
     UART1_IRQ => UartIrq<UART1>;
 });
 
@@ -48,6 +51,7 @@ bind_interrupts!(struct Irqs {
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbIrq<USB>;
     PIO0_IRQ_0 => PioIrq<PIO0>;
+    PIO1_IRQ_0 => PioIrq<PIO1>;
 });
 
 static COMMANDS: Channel<CriticalSectionRawMutex, Command, 8> = Channel::new();
@@ -58,37 +62,61 @@ async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     defmt::info!("tmc2209-fw booting");
 
-    // ── TMC2209 UART bus (shared half-duplex) ─────────────────────────────
+    // -- TMC2209 UART buses ------------------------------------------------
+    // UART1 carries J0..J3 (addresses 0..=3); UART0 carries J4 alone.
     #[cfg(feature = "uart")]
     let bus: &'static DriverBus = {
-        static TX_BUF: StaticCell<[u8; 64]> = StaticCell::new();
-        static RX_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+        static TX0_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+        static RX0_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+        static TX1_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+        static RX1_BUF: StaticCell<[u8; 64]> = StaticCell::new();
         let mut uart_cfg = UartConfig::default();
         uart_cfg.baudrate = board::TMC_BAUD;
-        let uart = BufferedUart::new(
+        let uart0 = BufferedUart::new(
+            p.UART0,
+            p.PIN_0,
+            p.PIN_1,
+            Irqs,
+            TX0_BUF.init([0; 64]),
+            RX0_BUF.init([0; 64]),
+            uart_cfg,
+        );
+        let uart1 = BufferedUart::new(
             p.UART1,
             p.PIN_8,
             p.PIN_9,
             Irqs,
-            TX_BUF.init([0; 64]),
-            RX_BUF.init([0; 64]),
+            TX1_BUF.init([0; 64]),
+            RX1_BUF.init([0; 64]),
             uart_cfg,
         );
-        DRIVER_BUS.init(DriverBus::new(uart))
+        DRIVER_BUS.init(DriverBus::new(uart0, uart1))
     };
     #[cfg(not(feature = "uart"))]
     let bus: &'static DriverBus = DRIVER_BUS.init(DriverBus::new());
 
-    // ── PIO step-gen + motion controller ──────────────────────────────────
-    let pio = Pio::new(p.PIO0, Irqs);
+    // -- PIO step-gen + motion controller ----------------------------------
+    // PIO0 hosts J0..J3 on SM0..SM3; PIO1 hosts J4 on SM0.
+    let pio0 = Pio::new(p.PIO0, Irqs);
+    let pio1 = Pio::new(p.PIO1, Irqs);
+    #[cfg(not(feature = "rp2040-zero"))]
+    let dir4 = p.PIN_16;
+    #[cfg(feature = "rp2040-zero")]
+    let dir4 = p.PIN_26;
     let mut motion = MotionController::new(
-        pio, p.PIN_2, p.PIN_3, p.PIN_4, p.PIN_5, p.PIN_6, p.PIN_7, p.PIN_10,
+        pio0, pio1,
+        p.PIN_2, p.PIN_3, p.PIN_4, p.PIN_11, p.PIN_12,
+        p.PIN_5, p.PIN_6, p.PIN_7, p.PIN_13, dir4,
+        p.PIN_10,
     );
 
-    // ── USB CDC ───────────────────────────────────────────────────────────
+    // -- Servo PWM (slice 7, GP14 ch A, GP15 ch B) ------------------------
+    servo::spawn(spawner, p.PWM_SLICE7, p.PIN_14, p.PIN_15);
+
+    // -- USB CDC ----------------------------------------------------------
     let usb_driver = UsbDriver::new(p.USB, Irqs);
 
-    // ── Spawn tasks ───────────────────────────────────────────────────────
+    // -- Spawn tasks ------------------------------------------------------
     #[cfg(feature = "uart")]
     spawner.must_spawn(driver_init_task(bus));
     spawner.must_spawn(usb_task(usb_driver, bus));

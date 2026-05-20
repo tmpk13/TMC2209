@@ -1,14 +1,19 @@
-//! TMC2209 UART bus — up to 4 drivers addressed 0..=3 on a shared half-duplex line.
+//! TMC2209 UART buses.
 //!
-//! The TMC2209 exposes a single-wire UART (PDN_UART pin). When multiple drivers
-//! share the same wire, each driver gets a unique address via its MS1/MS2 pins
-//! at power-up (datasheet §5). A read datagram is a 4-byte request followed by
-//! an 8-byte reply; a write datagram is 8 bytes with no reply.
+//! The TMC2209 exposes a single-wire UART (PDN_UART pin). When multiple
+//! drivers share the same wire, each driver gets a unique address via its
+//! MS1/MS2 pins at power-up (datasheet section 5). Addresses are 2 bits, so
+//! at most 4 drivers can share one bus.
 //!
-//! On a physically-shared TX/RX line the MCU sees its own transmitted bytes
-//! echoed back before any driver reply. `tmc2209::Reader` handles this for us
-//! by searching for the response sync byte, so we can feed it every byte we
-//! read back without filtering.
+//! We have 5 joints, so J0..J3 share UART1 (addresses 0..=3) and J4 lives
+//! alone on UART0 (address 0). `DriverBus` owns both UARTs and routes by
+//! `JointId`. With `--no-default-features` (uart off) neither UART is
+//! initialized and the bus methods become no-ops / `Error::Uart`.
+//!
+//! A read datagram is a 4-byte request followed by an 8-byte reply; a write
+//! datagram is 8 bytes with no reply. On a physically-shared TX/RX line the
+//! MCU sees its own transmitted bytes echoed back before any driver reply;
+//! `tmc2209::Reader` walks the stream and finds the response sync byte.
 
 #[cfg(feature = "uart")]
 use embassy_rp::uart::BufferedUart;
@@ -28,26 +33,48 @@ use tmc2209::reg;
 #[cfg(feature = "uart")]
 use crate::protocol::{TMC_FLAG_INTERPOLATE, TMC_FLAG_SHAFT_INVERT, TMC_FLAG_STEALTHCHOP};
 
-/// Joint index → TMC2209 UART address.
+/// Joint index -> TMC2209 UART address. The address only identifies the
+/// driver on its bus; routing to the correct bus is done by `bus_index()`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum JointId {
     J0 = 0,
     J1 = 1,
     J2 = 2,
+    J3 = 3,
+    J4 = 4,
 }
 
 impl JointId {
-    pub const ALL: [Self; 3] = [Self::J0, Self::J1, Self::J2];
-    pub fn addr(self) -> u8 {
-        self as u8
-    }
+    pub const ALL: [Self; 5] = [Self::J0, Self::J1, Self::J2, Self::J3, Self::J4];
+
     pub fn from_index(i: u8) -> Option<Self> {
         match i {
             0 => Some(Self::J0),
             1 => Some(Self::J1),
             2 => Some(Self::J2),
+            3 => Some(Self::J3),
+            4 => Some(Self::J4),
             _ => None,
+        }
+    }
+
+    /// TMC2209 UART address on this joint's bus (0..=3).
+    pub fn addr(self) -> u8 {
+        match self {
+            Self::J0 => 0,
+            Self::J1 => 1,
+            Self::J2 => 2,
+            Self::J3 => 3,
+            Self::J4 => 0, // alone on its bus
+        }
+    }
+
+    /// Which UART bus this joint lives on. 1 = UART1 (J0..J3), 0 = UART0 (J4).
+    fn bus_index(self) -> u8 {
+        match self {
+            Self::J0 | Self::J1 | Self::J2 | Self::J3 => 1,
+            Self::J4 => 0,
         }
     }
 }
@@ -57,81 +84,43 @@ impl JointId {
 #[cfg(feature = "uart")]
 pub const DEFAULT_TMC_FLAGS: u8 = TMC_FLAG_STEALTHCHOP | TMC_FLAG_INTERPOLATE;
 
-pub struct DriverBus {
-    #[cfg(feature = "uart")]
+#[cfg(feature = "uart")]
+struct Bus {
     uart: Mutex<CriticalSectionRawMutex, BufferedUart>,
 }
 
-impl DriverBus {
-    #[cfg(feature = "uart")]
-    pub fn new(uart: BufferedUart) -> Self {
+#[cfg(feature = "uart")]
+impl Bus {
+    fn new(uart: BufferedUart) -> Self {
         Self {
             uart: Mutex::new(uart),
         }
     }
 
-    #[cfg(not(feature = "uart"))]
-    pub fn new() -> Self {
-        Self {}
-    }
-
-    /// Write a TMC2209 register on one driver. No reply is expected; we wait
-    /// long enough to flush the bytes out of the TX buffer.
-    #[cfg(feature = "uart")]
-    pub async fn write_register<R>(&self, joint: JointId, value: R) -> Result<(), Error>
+    async fn write_register<R>(&self, addr: u8, value: R) -> Result<(), Error>
     where
         R: reg::WritableRegister,
     {
-        let req = write_request(joint.addr(), value);
+        let req = write_request(addr, value);
         let mut uart = self.uart.lock().await;
         uart.write_all(req.bytes()).await.map_err(|_| Error::Uart)?;
-        // Drain the echoed bytes so the next read sees a clean line.
         let mut echo = [0u8; 8];
         let _ = with_timeout(Duration::from_millis(10), uart.read_exact(&mut echo)).await;
         Ok(())
     }
 
-    #[cfg(not(feature = "uart"))]
-    pub async fn write_register<R>(&self, _joint: JointId, _value: R) -> Result<(), Error>
-    where
-        R: reg::WritableRegister,
-    {
-        Ok(())
-    }
-
-    /// Capacity of the raw RX trace buffer captured by `read_register_traced`.
-    pub const RX_TRACE_CAP: usize = 16;
-
-    /// Like [`read_register`] but also returns the raw bytes received on the
-    /// wire during the read attempt (truncated to `RX_TRACE_CAP`). Used by
-    /// the diagnostic GetTmcConfig path so the host can show hex of what
-    /// actually came back, distinguishing "chip silent" (0 bytes) from
-    /// "chip replied with garbage" (some bytes, no parse).
-    #[cfg(not(feature = "uart"))]
-    pub async fn read_register_traced<R>(
+    async fn read_register_traced<R>(
         &self,
-        _joint: JointId,
-    ) -> (Result<R, Error>, [u8; Self::RX_TRACE_CAP], u8)
+        addr: u8,
+    ) -> (Result<R, Error>, [u8; DriverBus::RX_TRACE_CAP], u8)
     where
         R: reg::ReadableRegister,
     {
-        (Err(Error::Uart), [0u8; Self::RX_TRACE_CAP], 0)
-    }
-
-    #[cfg(feature = "uart")]
-    pub async fn read_register_traced<R>(
-        &self,
-        joint: JointId,
-    ) -> (Result<R, Error>, [u8; Self::RX_TRACE_CAP], u8)
-    where
-        R: reg::ReadableRegister,
-    {
-        let mut trace = [0u8; Self::RX_TRACE_CAP];
+        let mut trace = [0u8; DriverBus::RX_TRACE_CAP];
         let mut trace_len: u8 = 0;
-        let req = read_request::<R>(joint.addr());
+        let req = read_request::<R>(addr);
         let mut uart = self.uart.lock().await;
 
-        // Drain stale bytes from prior writes' echoes etc.
         let mut scratch = [0u8; 16];
         while let Ok(Ok(_)) =
             with_timeout(Duration::from_millis(1), uart.read(&mut scratch)).await
@@ -152,8 +141,7 @@ impl DriverBus {
                 if n == 0 {
                     continue;
                 }
-                // Append to trace, capped.
-                let room = (Self::RX_TRACE_CAP as u8).saturating_sub(trace_len) as usize;
+                let room = (DriverBus::RX_TRACE_CAP as u8).saturating_sub(trace_len) as usize;
                 let take = n.min(room);
                 if take > 0 {
                     let dst = trace_len as usize;
@@ -175,27 +163,13 @@ impl DriverBus {
         (parsed, trace, trace_len)
     }
 
-    /// Read a TMC2209 register from one driver.
-    #[cfg(not(feature = "uart"))]
-    pub async fn read_register<R>(&self, _joint: JointId) -> Result<R, Error>
+    async fn read_register<R>(&self, addr: u8) -> Result<R, Error>
     where
         R: reg::ReadableRegister,
     {
-        Err(Error::Uart)
-    }
-
-    #[cfg(feature = "uart")]
-    pub async fn read_register<R>(&self, joint: JointId) -> Result<R, Error>
-    where
-        R: reg::ReadableRegister,
-    {
-        let req = read_request::<R>(joint.addr());
+        let req = read_request::<R>(addr);
         let mut uart = self.uart.lock().await;
 
-        // Drain any stale bytes left in the RX buffer from a previous
-        // operation (e.g., partial echo from a prior write_register that
-        // straddled the 10ms drain window). Without this, `Reader` may
-        // try to interpret junk as a response prefix and give up.
         let mut scratch = [0u8; 16];
         while let Ok(Ok(_)) =
             with_timeout(Duration::from_millis(1), uart.read(&mut scratch)).await
@@ -203,13 +177,8 @@ impl DriverBus {
 
         uart.write_all(req.bytes()).await.map_err(|_| Error::Uart)?;
 
-        // On a shared single-wire bus we first see a 4-byte echo of our own
-        // request and then 8 bytes of reply. On a split TX/RX wiring the
-        // echo never arrives — only the 8-byte reply. `Reader` walks the
-        // stream and surfaces the response as soon as it sees the sync byte
-        // + payload, so we don't need to count bytes. 50ms is generous
-        // versus the ~16.7ms wall-clock of 16 bytes at 9600 baud, and
-        // forgiving of any UART/IRQ latency in the buffered driver.
+        // 50ms is generous versus the ~16.7ms wall-clock of 16 bytes at 9600
+        // baud, and forgiving of any UART/IRQ latency in the buffered driver.
         let mut reader = Reader::default();
         let mut buf = [0u8; 16];
         let response: ReadResponse = with_timeout(Duration::from_millis(50), async {
@@ -228,6 +197,101 @@ impl DriverBus {
 
         response.register::<R>().map_err(|_| Error::BadRegister)
     }
+}
+
+pub struct DriverBus {
+    #[cfg(feature = "uart")]
+    bus0: Bus, // UART0 - J4 only
+    #[cfg(feature = "uart")]
+    bus1: Bus, // UART1 - J0..J3
+}
+
+impl DriverBus {
+    /// Capacity of the raw RX trace buffer captured by `read_register_traced`.
+    pub const RX_TRACE_CAP: usize = 16;
+
+    #[cfg(feature = "uart")]
+    pub fn new(uart0: BufferedUart, uart1: BufferedUart) -> Self {
+        Self {
+            bus0: Bus::new(uart0),
+            bus1: Bus::new(uart1),
+        }
+    }
+
+    #[cfg(not(feature = "uart"))]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[cfg(feature = "uart")]
+    fn bus_for(&self, joint: JointId) -> &Bus {
+        match joint.bus_index() {
+            0 => &self.bus0,
+            _ => &self.bus1,
+        }
+    }
+
+    /// Write a TMC2209 register on one driver. No reply is expected; we wait
+    /// long enough to flush the bytes out of the TX buffer.
+    #[cfg(feature = "uart")]
+    pub async fn write_register<R>(&self, joint: JointId, value: R) -> Result<(), Error>
+    where
+        R: reg::WritableRegister,
+    {
+        self.bus_for(joint).write_register(joint.addr(), value).await
+    }
+
+    #[cfg(not(feature = "uart"))]
+    pub async fn write_register<R>(&self, _joint: JointId, _value: R) -> Result<(), Error>
+    where
+        R: reg::WritableRegister,
+    {
+        Ok(())
+    }
+
+    /// Like [`read_register`] but also returns the raw bytes received during
+    /// the read attempt (truncated to `RX_TRACE_CAP`). Used by the diagnostic
+    /// `GetTmcConfig` path so the host can show hex of what came back -
+    /// distinguishing "chip silent" (0 bytes) from "chip replied with garbage"
+    /// (some bytes, no parse).
+    #[cfg(feature = "uart")]
+    pub async fn read_register_traced<R>(
+        &self,
+        joint: JointId,
+    ) -> (Result<R, Error>, [u8; Self::RX_TRACE_CAP], u8)
+    where
+        R: reg::ReadableRegister,
+    {
+        self.bus_for(joint).read_register_traced(joint.addr()).await
+    }
+
+    #[cfg(not(feature = "uart"))]
+    pub async fn read_register_traced<R>(
+        &self,
+        _joint: JointId,
+    ) -> (Result<R, Error>, [u8; Self::RX_TRACE_CAP], u8)
+    where
+        R: reg::ReadableRegister,
+    {
+        (Err(Error::Uart), [0u8; Self::RX_TRACE_CAP], 0)
+    }
+
+    /// Read a TMC2209 register from one driver.
+    #[cfg(feature = "uart")]
+    pub async fn read_register<R>(&self, joint: JointId) -> Result<R, Error>
+    where
+        R: reg::ReadableRegister,
+    {
+        self.bus_for(joint).read_register(joint.addr()).await
+    }
+
+    #[cfg(not(feature = "uart"))]
+    pub async fn read_register<R>(&self, _joint: JointId) -> Result<R, Error>
+    where
+        R: reg::ReadableRegister,
+    {
+        Err(Error::Uart)
+    }
 
     /// Baseline configuration shared across every joint:
     /// - UART-controlled current, microstep resolution set via MRES in CHOPCONF
@@ -237,7 +301,7 @@ impl DriverBus {
     pub async fn apply_default_config(&self, joint: JointId) -> Result<(), Error> {
         self.apply_gconf_chopconf(joint, DEFAULT_TMC_FLAGS).await?;
 
-        // Motor current: IRUN=16, IHOLD=8, IHOLDDELAY=8 — conservative defaults.
+        // Motor current: IRUN=16, IHOLD=8, IHOLDDELAY=8 - conservative defaults.
         // Real current depends on sense-resistor value; tune per board.
         let mut ihold = reg::IHOLD_IRUN::default();
         ihold.set_ihold(8);

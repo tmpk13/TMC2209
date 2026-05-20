@@ -172,6 +172,7 @@
     <button class="tab" data-tab="servos">Servos</button>
     <button class="tab" data-tab="tmc">TMC</button>
     <button class="tab" data-tab="ik">IK</button>
+    <button class="tab" data-tab="joystick">Joystick</button>
     <button class="tab" data-tab="options">Options</button>
   </div>
 
@@ -292,6 +293,47 @@
       </div>
       <div class="row head">result</div>
       <pre id="ik-result" style="background:#0d0f13; padding:6px; border-radius:4px; max-height:200px; overflow:auto; font-size:11px;"></pre>
+    </div>
+
+    <!-- ============ Joystick tab ============ -->
+    <div class="tab-page" data-tab="joystick">
+      <h2>USB joystick</h2>
+      <div class="hint">
+        Reads <code>/dev/input/jsN</code>. Analog axes command motor
+        <i>velocity</i> directly: stick deflection x sensitivity sets vmax for
+        joints (steps/s) and gates motion for servos (which travel at their
+        configured speed). Releasing the stick stops the motor at its current
+        position - the target does not accumulate. Buttons still add their
+        sensitivity (in target units) once per press.
+      </div>
+      <div class="row">
+        <label><input type="checkbox" id="js-enable"/> enable joystick</label>
+        <label>device</label>
+        <input id="js-device" type="text" value="/dev/input/js0" style="width:180px"/>
+        <button id="js-apply-device">apply</button>
+        <span id="js-status" class="badge">off</span>
+      </div>
+      <div id="js-device-name" class="hint" style="margin-top:4px"></div>
+
+      <h2>Axes</h2>
+      <div class="row head">
+        <span style="flex:0 0 28px">idx</span>
+        <span style="flex:1.5">live</span>
+        <span style="flex:1">target</span>
+        <span style="flex:1">sens (u/s)</span>
+        <span style="flex:0.7">deadzone</span>
+        <span style="flex:0.5">invert</span>
+      </div>
+      <div id="js-axes"></div>
+
+      <h2>Buttons</h2>
+      <div class="row head">
+        <span style="flex:0 0 28px">idx</span>
+        <span style="flex:0.4">st</span>
+        <span style="flex:1">target</span>
+        <span style="flex:1">sens (u/press)</span>
+      </div>
+      <div id="js-buttons"></div>
     </div>
 
     <!-- ============ Options tab ============ -->
@@ -1050,6 +1092,207 @@ function paintIkStatus(r) {
   if (r.ok) { el.textContent = "loaded"; el.classList.add("ok"); }
   else { el.textContent = r.error || "error"; el.classList.add("bad"); }
 }
+
+// == Joystick tab =========================================================
+
+const jsState = {
+  enabled: false,
+  device: "/dev/input/js0",
+  device_name: "",
+  connected: false,
+  error: "",
+  n_axes: 6,
+  n_buttons: 12,
+  axis_state: [0,0,0,0,0,0,0,0],
+  button_state: Array(16).fill(0),
+  axes_cfg: [],
+  buttons_cfg: [],
+};
+
+function jsTargetOptions(selected) {
+  const opts = ['<option value="none"' + (selected === "none" ? " selected" : "") + ">none</option>"];
+  for (let j = 0; j < NUM_JOINTS; j++) {
+    const v = `joint:${j}`;
+    opts.push(`<option value="${v}"${selected === v ? " selected" : ""}>${JOINT_LABELS[j] || "J"+j}</option>`);
+  }
+  for (let s = 0; s < NUM_SERVOS; s++) {
+    const v = `servo:${s}`;
+    opts.push(`<option value="${v}"${selected === v ? " selected" : ""}>Servo ${s}</option>`);
+  }
+  return opts.join("");
+}
+
+function jsAxisBar(value, max) {
+  const width = 21;
+  const mid = Math.floor(width / 2);
+  let pos = mid + Math.round((value / max) * mid);
+  pos = Math.max(0, Math.min(width - 1, pos));
+  const chars = Array(width).fill("-");
+  chars[mid] = "|";
+  chars[pos] = "#";
+  return "[" + chars.join("") + "] " + String(value).padStart(6, " ");
+}
+
+let _jsCfgSeeded = false;
+async function pollJoystick() {
+  try {
+    const r = await fetch("/joystick", { cache: "no-store" });
+    if (!r.ok) return;
+    const s = await r.json();
+    jsState.enabled = s.enabled;
+    jsState.device = s.device;
+    jsState.device_name = s.device_name;
+    jsState.connected = s.connected;
+    jsState.error = s.error;
+    jsState.n_axes = s.n_axes || jsState.n_axes;
+    jsState.n_buttons = s.n_buttons || jsState.n_buttons;
+    jsState.axis_state = s.axis_state || jsState.axis_state;
+    jsState.button_state = s.button_state || jsState.button_state;
+    // Seed cfg from the server exactly once. After that the local UI is the
+    // source of truth - a poll that's in flight while the user is typing
+    // would otherwise race the config POST and reset the field.
+    if (!_jsCfgSeeded && Array.isArray(s.axes_cfg) && s.axes_cfg.length) {
+      jsState.axes_cfg = s.axes_cfg;
+      jsState.buttons_cfg = s.buttons_cfg || jsState.buttons_cfg;
+      _jsCfgSeeded = true;
+    }
+    renderJoystick();
+  } catch (e) { /* ignore */ }
+}
+setInterval(pollJoystick, 100);
+
+function renderJoystick() {
+  const en = document.getElementById("js-enable");
+  if (en && document.activeElement !== en) en.checked = !!jsState.enabled;
+  const dev = document.getElementById("js-device");
+  if (dev && !dev.dataset.dirty) dev.value = jsState.device;
+  const st = document.getElementById("js-status");
+  st.classList.remove("ok", "bad", "warn");
+  if (!jsState.enabled) { st.textContent = "off"; }
+  else if (jsState.connected) { st.textContent = "live"; st.classList.add("ok"); }
+  else { st.textContent = jsState.error || "no device"; st.classList.add("bad"); }
+  const nm = document.getElementById("js-device-name");
+  if (nm) nm.textContent = jsState.device_name
+    ? `device: ${jsState.device_name} (${jsState.n_axes} axes, ${jsState.n_buttons} btns)`
+    : "";
+
+  // Axes
+  const axesHost = document.getElementById("js-axes");
+  const naxes = Math.max(jsState.n_axes || 6, jsState.axes_cfg.length, 6);
+  if (axesHost.childElementCount !== naxes) {
+    axesHost.innerHTML = "";
+    for (let i = 0; i < naxes; i++) {
+      const cfg = jsState.axes_cfg[i] || { target: "none", sensitivity: 0, deadzone: 0.1, invert: false };
+      const row = document.createElement("div");
+      row.className = "row";
+      row.innerHTML = `
+        <span style="flex:0 0 28px">${i}</span>
+        <span style="flex:1.5"><code id="jsa-bar-${i}">[---------|---------]      0</code></span>
+        <select class="jsa-target" data-i="${i}" data-jsdirty="1" style="flex:1">${jsTargetOptions(cfg.target)}</select>
+        <input  class="jsa-sens"   data-i="${i}" data-jsdirty="1" type="number" step="100" value="${cfg.sensitivity}" style="flex:1;width:auto"/>
+        <input  class="jsa-dz"     data-i="${i}" data-jsdirty="1" type="number" step="0.01" min="0" max="0.95" value="${cfg.deadzone}" style="flex:0.7;width:auto"/>
+        <label style="flex:0.5"><input class="jsa-inv" data-i="${i}" data-jsdirty="1" type="checkbox" ${cfg.invert ? "checked" : ""}/></label>
+      `;
+      axesHost.appendChild(row);
+    }
+    axesHost.querySelectorAll(".jsa-target,.jsa-sens,.jsa-dz,.jsa-inv").forEach((el) =>
+      el.addEventListener("change", postJoystickCfg));
+  } else {
+    for (let i = 0; i < naxes; i++) {
+      const bar = document.getElementById(`jsa-bar-${i}`);
+      if (bar) bar.textContent = jsAxisBar(jsState.axis_state[i] | 0, 32767);
+      const cfg = jsState.axes_cfg[i];
+      if (!cfg) continue;
+      const t = axesHost.querySelector(`.jsa-target[data-i="${i}"]`);
+      if (t && document.activeElement !== t) t.value = cfg.target;
+      const s = axesHost.querySelector(`.jsa-sens[data-i="${i}"]`);
+      if (s && document.activeElement !== s) s.value = cfg.sensitivity;
+      const d = axesHost.querySelector(`.jsa-dz[data-i="${i}"]`);
+      if (d && document.activeElement !== d) d.value = cfg.deadzone;
+      const inv = axesHost.querySelector(`.jsa-inv[data-i="${i}"]`);
+      if (inv && document.activeElement !== inv) inv.checked = !!cfg.invert;
+    }
+  }
+
+  // Buttons
+  const btnHost = document.getElementById("js-buttons");
+  const nbtns = Math.max(jsState.n_buttons || 12, jsState.buttons_cfg.length, 12);
+  if (btnHost.childElementCount !== nbtns) {
+    btnHost.innerHTML = "";
+    for (let i = 0; i < nbtns; i++) {
+      const cfg = jsState.buttons_cfg[i] || { target: "none", sensitivity: 100 };
+      const row = document.createElement("div");
+      row.className = "row";
+      row.innerHTML = `
+        <span style="flex:0 0 28px">${i}</span>
+        <span class="badge" style="flex:0.4" id="jsb-st-${i}">.</span>
+        <select class="jsb-target" data-i="${i}" data-jsdirty="1" style="flex:1">${jsTargetOptions(cfg.target)}</select>
+        <input  class="jsb-sens"   data-i="${i}" data-jsdirty="1" type="number" step="10" value="${cfg.sensitivity}" style="flex:1;width:auto"/>
+      `;
+      btnHost.appendChild(row);
+    }
+    btnHost.querySelectorAll(".jsb-target,.jsb-sens").forEach((el) =>
+      el.addEventListener("change", postJoystickCfg));
+  } else {
+    for (let i = 0; i < nbtns; i++) {
+      const st = document.getElementById(`jsb-st-${i}`);
+      if (st) {
+        const pressed = !!jsState.button_state[i];
+        st.textContent = pressed ? "DN" : ".";
+        st.classList.toggle("ok", pressed);
+      }
+      const cfg = jsState.buttons_cfg[i];
+      if (!cfg) continue;
+      const t = btnHost.querySelector(`.jsb-target[data-i="${i}"]`);
+      if (t && document.activeElement !== t) t.value = cfg.target;
+      const s = btnHost.querySelector(`.jsb-sens[data-i="${i}"]`);
+      if (s && document.activeElement !== s) s.value = cfg.sensitivity;
+    }
+  }
+}
+
+function gatherJoystickCfg() {
+  const axes_cfg = [];
+  document.querySelectorAll("#js-axes .row").forEach((row, i) => {
+    axes_cfg.push({
+      target: row.querySelector(".jsa-target").value,
+      sensitivity: Number(row.querySelector(".jsa-sens").value) || 0,
+      deadzone: Math.max(0, Math.min(0.95, Number(row.querySelector(".jsa-dz").value) || 0)),
+      invert: row.querySelector(".jsa-inv").checked,
+    });
+  });
+  const buttons_cfg = [];
+  document.querySelectorAll("#js-buttons .row").forEach((row, i) => {
+    buttons_cfg.push({
+      target: row.querySelector(".jsb-target").value,
+      sensitivity: Number(row.querySelector(".jsb-sens").value) || 0,
+    });
+  });
+  return { axes_cfg, buttons_cfg };
+}
+
+async function postJoystickCfg() {
+  const body = gatherJoystickCfg();
+  // Update local state immediately so any in-flight poll can't reset us.
+  jsState.axes_cfg = body.axes_cfg;
+  jsState.buttons_cfg = body.buttons_cfg;
+  const r = await postJSON("/joystick/config", body);
+  if (r && r.state) {
+    // Server is canonical only for clamped values (e.g. deadzone clamp).
+    jsState.axes_cfg = r.state.axes_cfg;
+    jsState.buttons_cfg = r.state.buttons_cfg;
+  }
+}
+
+document.getElementById("js-enable").addEventListener("change", async (e) => {
+  await postJSON("/joystick/config", { enabled: e.target.checked });
+});
+document.getElementById("js-device").addEventListener("input", (e) => { e.target.dataset.dirty = "1"; });
+document.getElementById("js-apply-device").addEventListener("click", async () => {
+  const dev = document.getElementById("js-device");
+  await postJSON("/joystick/config", { device: dev.value || "/dev/input/js0" });
+  delete dev.dataset.dirty;
+});
 
 // == status + summary =====================================================
 
