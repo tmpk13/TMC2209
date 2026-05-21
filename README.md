@@ -45,21 +45,25 @@ rustup target add thumbv6m-none-eabi         # RP2040
 cargo install elf2uf2-rs
 ```
 
-## Pin map (Pico / Pico 2 - same 40-pin footprint)
+## Pin map
 
-| Pin       | Signal              | Notes |
-|-----------|---------------------|-------|
-| GP2/3/4   | STEP0/1/2           | PIO0 SM0..SM2 (linkages) |
-| GP11      | STEP3               | PIO0 SM3 (base rotation) |
-| GP13      | STEP4               | PIO1 SM0 (linear stage)  |
-| GP5/6/7   | DIR0/1/2            | |
-| GP12      | DIR3                | |
-| GP18      | DIR4                | |
-| GP8/9     | TMC UART1 TX/RX     | primary bus (J0..J3); on bare-chip wiring tie via 1k for single-wire, BTT-style breakouts expose split TX/RX so wire MCU-TX -> breakout-RX, MCU-RX -> breakout-TX |
-| GP0/1     | TMC UART0 TX/RX     | secondary bus (J4); same wiring rules as primary |
-| GP10      | EN (shared)         | active-low, starts disabled; for bringup you can tie EN to GND directly to keep all drivers permanently enabled |
-| GP14/15   | Servo0/Servo1       | PWM slice 7 A/B, 50 Hz |
-| GP25      | LED                 | RP2040-Zero (`--features rp2040-zero`) remaps this to GP26, since GP25 isn't broken out on that board |
+Pico / Pico 2 share the 40-pin footprint and use the same assignments. The
+Waveshare RP2040-Zero only breaks out GP0..=15 and GP26..=29 (GP16 drives the
+onboard WS2812), so two pins are remapped under `--features rp2040-zero`.
+
+| Signal          | Pico / Pico 2 | Pico Zero (`rp2040-zero`) | Notes |
+|-----------------|---------------|---------------------------|-------|
+| STEP0/1/2       | GP2/3/4       | GP2/3/4                   | PIO0 SM0..SM2 (linkages) |
+| STEP3           | GP11          | GP11                      | PIO0 SM3 (base rotation) |
+| STEP4           | GP12          | GP12                      | PIO1 SM0 (linear stage)  |
+| DIR0/1/2        | GP5/6/7       | GP5/6/7                   | |
+| DIR3            | GP13          | GP13                      | |
+| DIR4            | GP16          | **GP26**                  | GP16 is the WS2812 on Pico Zero, so DIR4 moves to GP26 |
+| TMC UART1 TX/RX | GP8/9         | GP8/9                     | primary bus (J0..J3); on bare-chip wiring tie via 1k for single-wire, BTT-style breakouts expose split TX/RX so wire MCU-TX -> breakout-RX, MCU-RX -> breakout-TX |
+| TMC UART0 TX/RX | GP0/1         | GP0/1                     | secondary bus (J4); same wiring rules as primary |
+| EN (shared)     | GP10          | GP10                      | active-low, starts disabled; for bringup you can tie EN to GND directly to keep all drivers permanently enabled |
+| Servo0/Servo1   | GP14/15       | GP14/15                   | PWM slice 7 A/B, 50 Hz |
+| LED             | GP25          | **GP27**                  | GP25 isn't broken out on Pico Zero; GP27 is exposed as an external-indicator pin |
 
 ## TMC2209 single-wire UART buses
 
