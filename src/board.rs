@@ -58,6 +58,21 @@ pub type LedPin = peripherals::PIN_25;
 #[cfg(feature = "rp2040-zero")]
 pub type LedPin = peripherals::PIN_27;
 
+// Optional L298N H-bridge driving one brushed DC motor. IN1/IN2 set
+// direction (and brake/coast), ENA gates motor current via PWM. ENA is on
+// PWM slice 1 channel B (GP19); the servos already own slice 7. Not wired
+// on rp2040-zero - GP17..GP19 are not broken out on its castellated edge.
+#[cfg(all(feature = "l298n", not(feature = "rp2040-zero")))]
+pub type L298nIn1Pin = peripherals::PIN_17;
+#[cfg(all(feature = "l298n", not(feature = "rp2040-zero")))]
+pub type L298nIn2Pin = peripherals::PIN_18;
+#[cfg(all(feature = "l298n", not(feature = "rp2040-zero")))]
+pub type L298nEnaPin = peripherals::PIN_19;
+#[cfg(all(feature = "l298n", not(feature = "rp2040-zero")))]
+pub type L298nPwmSlice = peripherals::PWM_SLICE1;
+#[cfg(all(feature = "l298n", feature = "rp2040-zero"))]
+compile_error!("feature `l298n` is not supported on rp2040-zero (GP17-GP19 are not broken out)");
+
 // USB.
 pub type Usb = peripherals::USB;
 

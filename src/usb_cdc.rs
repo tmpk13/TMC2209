@@ -139,6 +139,24 @@ async fn read_loop(
                 let _ = servo::COMMANDS
                     .try_send(servo::ServoCommand::SetConfig { servo, config });
             }
+            Ok(Command::SetDcMotor { id, duty }) => {
+                // Only one L298N motor is wired (id=0). Builds without the
+                // `l298n` feature accept and drop the frame so the host's
+                // protocol stays uniform across firmware variants.
+                #[cfg(feature = "l298n")]
+                {
+                    if id == 0 {
+                        let _ = crate::l298n::COMMANDS
+                            .try_send(crate::l298n::DcCommand::SetDuty { duty });
+                    } else {
+                        defmt::warn!("dc motor: bad id {}", id);
+                    }
+                }
+                #[cfg(not(feature = "l298n"))]
+                {
+                    let _ = (id, duty);
+                }
+            }
             Ok(Command::Enable { mask }) => {
                 // The mask carries one bit per joint (J0..J4). Servos enable
                 // alongside any joint enable so their home-on-enable fires

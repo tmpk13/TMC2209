@@ -20,6 +20,8 @@ use {defmt as _, embassy_rp as _};
 
 mod board;
 mod driver;
+#[cfg(feature = "l298n")]
+mod l298n;
 mod motion;
 mod protocol;
 mod servo;
@@ -112,6 +114,10 @@ async fn main(spawner: Spawner) {
 
     // -- Servo PWM (slice 7, GP14 ch A, GP15 ch B) ------------------------
     servo::spawn(spawner, p.PWM_SLICE7, p.PIN_14, p.PIN_15);
+
+    // -- Optional L298N brushed DC motor (slice 1 ch B, GP17/18 dir) ------
+    #[cfg(feature = "l298n")]
+    l298n::spawn(spawner, p.PWM_SLICE1, p.PIN_19, p.PIN_17, p.PIN_18);
 
     // -- USB CDC ----------------------------------------------------------
     let usb_driver = UsbDriver::new(p.USB, Irqs);

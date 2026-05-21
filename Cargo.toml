@@ -16,6 +16,9 @@ rp2040-zero = ["rp2040"]
 # (standalone) mode — UART hardware is not initialized and register reads
 # return Error::Uart; writes and config calls are silent no-ops.
 uart = []
+# Drive one brushed DC motor via an external L298N H-bridge as an additional
+# motor-control option alongside the TMC2209 steppers. See src/l298n.rs.
+l298n = []
 
 [dependencies]
 embassy-rp = { version = "0.10", default-features = false, features = [

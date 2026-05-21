@@ -26,6 +26,10 @@
 //!   0x0A  SetServoConfig  { servo: u8, min_us, max_us, deadzone_us,
 //!                            speed_us_per_s, home_us: u16, flags: u8 }
 //!         flags bit 0: home-on-enable
+//!   0x0B  SetDcMotor      { id: u8, duty: i16 }
+//!         Signed PWM duty in milli-units (-1000..=+1000) for an optional
+//!         L298N-driven brushed DC motor. Builds without the `l298n`
+//!         feature decode the frame and silently drop it.
 //!
 //! Reports (fw → host):
 //!   0x81  StateReport     { positions: [i32; 5], servos: [u16; 2], flags: u8 }
@@ -58,6 +62,7 @@ pub enum Command {
     GetVersion,
     SetServoTarget { servo: u8, target_us: u16 },
     SetServoConfig { servo: u8, config: ServoConfig },
+    SetDcMotor { id: u8, duty: i16 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -202,6 +207,14 @@ pub fn decode(bytes: &[u8]) -> Result<Command, DecodeError> {
                     flags,
                 },
             })
+        }
+        0x0B => {
+            if rest.len() < 1 + 2 {
+                return Err(DecodeError::Short);
+            }
+            let id = rest[0];
+            let duty = i16::from_le_bytes(rest[1..3].try_into().unwrap());
+            Ok(Command::SetDcMotor { id, duty })
         }
         _ => Err(DecodeError::BadTag),
     }

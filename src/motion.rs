@@ -286,7 +286,8 @@ impl<'d> MotionController<'d> {
             | Command::GetTmcConfig { .. }
             | Command::GetVersion
             | Command::SetServoTarget { .. }
-            | Command::SetServoConfig { .. } => {}
+            | Command::SetServoConfig { .. }
+            | Command::SetDcMotor { .. } => {}
         }
     }
 

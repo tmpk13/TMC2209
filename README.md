@@ -64,6 +64,8 @@ onboard WS2812), so two pins are remapped under `--features rp2040-zero`.
 | EN (shared)     | GP10          | GP10                      | active-low, starts disabled; for bringup you can tie EN to GND directly to keep all drivers permanently enabled |
 | Servo0/Servo1   | GP14/15       | GP14/15                   | PWM slice 7 A/B, 50 Hz |
 | LED             | GP25          | **GP27**                  | GP25 isn't broken out on Pico Zero; GP27 is exposed as an external-indicator pin |
+| L298N IN1/IN2   | GP17/18       | -                         | direction (only with `--features l298n`; Pico Zero doesn't expose these) |
+| L298N ENA       | GP19          | -                         | PWM slice 1 ch B, ~10 kHz speed input |
 
 ## TMC2209 single-wire UART buses
 
@@ -98,6 +100,36 @@ microsteps are programmed over the bus so the straps are address-only.
 
 Baud is 115200 on both buses. The firmware tolerates the echo of its own TX
 bytes transparently via `tmc2209::Reader`.
+
+## Optional brushed DC motor on an L298N (`--features l298n`)
+
+Alongside the TMC2209 steppers the firmware can drive one brushed DC motor
+through an external L298N dual H-bridge. Half of the L298N (channel A) is
+used; the other half is free for a second motor later.
+
+Wiring (one motor on the A side of the L298N):
+
+```
+  GP17 -> IN1
+  GP18 -> IN2
+  GP19 -> ENA          (PWM speed, ~10 kHz)
+  GND  -> L298N GND    (must share ground with the Pico)
+  +VM  -> L298N +12V   (motor supply, separate from logic 5V)
+  OUT1/OUT2 -> motor terminals
+```
+
+Leave the ENA jumper off if your L298N has one. Tie L298N's logic +5V to a
+5 V supply (USB 5 V on the Pico carrier works for most clones, but check
+your board's silkscreen - some need an external 5 V). The Pico's ground
+**must** be common with the motor PSU ground or PWM edges won't be seen.
+
+Host commands the motor with `SetDcMotor { id: 0, duty: i16 }` where
+`duty` is signed milli-units in `-1000..=+1000`. Sign sets direction,
+magnitude sets PWM duty (0 = coast). Builds without `--features l298n`
+still decode the frame so the host protocol is uniform; they just drop it.
+
+Not available on `rp2040-zero` - GP17-GP19 are not broken out on its
+castellated edge, and enabling the feature there is a compile error.
 
 ## Motor power
 
@@ -155,6 +187,7 @@ the TUI.
 | 0x08 | host->fw  | GetVersion -> 0x84                                                   |
 | 0x09 | host->fw  | SetServoTarget { id:u8, target_us:u16 }                              |
 | 0x0A | host->fw  | SetServoConfig { id, min, max, deadzone, speed, home_us, flags }     |
+| 0x0B | host->fw  | SetDcMotor { id:u8, duty:i16 } (-1000..=+1000; L298N option)        |
 | 0x81 | fw->host  | StateReport { positions:[i32;5], servos:[u16;2], flags:u8 }          |
 | 0x83 | fw->host  | TmcConfigReport (GCONF + CHOPCONF + rx trace for diagnostics)        |
 | 0x84 | fw->host  | VersionReport (chip id, build epoch, git short rev)                  |
